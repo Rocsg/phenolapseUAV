@@ -36,8 +36,10 @@ registered previews, additive red/green quality control, stable point
 identifiers, persistent directed registration graphs, and a multi-image crop
 stack for checking an exported series. It processes spectral bands
 independently and places all exported images on a user-selected reference
-geometry. Command-line workflows are also provided for automatic pairwise and
-series registration.
+geometry. A shapefile workflow reprojects field-plot polygons onto this common
+grid and exports per-region spectral statistics, scientific image patches,
+binary masks, and pseudo-RGB products. Command-line workflows are also provided
+for automatic pairwise and series registration.
 
 # Statement of need
 
@@ -59,6 +61,14 @@ similarity transform, an affine transform, and a local thin-plate spline using
 scikit-image [@skimage]. Full-resolution GeoTIFFs are read and written with
 Rasterio [@rasterio], one spectral band at a time. napari [@napari] provides the
 viewer, layers, navigation, and plugin integration.
+
+After registration, polygon geometries from a georeferenced shapefile are
+transformed into the selected raster CRS. Pixel-center inclusion and raster
+validity masks define plot-level observations. Tab-separated outputs report
+descriptive statistics for every region, acquisition, sensor, and band, while
+GeoTIFF patches retain the common reference grid, scientific datatype, nodata,
+and spatial calibration. This supports downstream analysis in geospatial tools
+and ImageJ/Fiji without resampling the exported measurements again.
 
 # Availability
 

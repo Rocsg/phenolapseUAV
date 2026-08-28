@@ -8,18 +8,30 @@ during export and are warped separately, one spectral band at a time.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import struct
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 import numpy as np
-
 
 SIMILARITY_MIN_PAIRS = 4
 AFFINE_MIN_PAIRS = 7
 TPS_MIN_PAIRS = 10
 DEFAULT_PERCENTILES = (0.5, 99.5)
+EXPORT_MANIFEST_FILENAME = "phenolapseuav_export.json"
+EXPORT_POINTER_FILENAME = ".phenolapseuav_last_export.json"
+REGISTERED_IMAGES_DIRECTORY = "REGISTERED_IMAGES"
+EXPORT_SUBSAMPLE_FACTORS = (1, 2, 4)
+DEFAULT_EXPORT_WORKERS = 4
+DEFAULT_EXPORT_SUBSAMPLE = 4
+CROP_PADDING_PIXELS = 5
 
 
 @dataclass
@@ -34,6 +46,24 @@ class LandmarkPair:
     @property
     def complete(self) -> bool:
         return self.fixed_yx is not None and self.moving_yx is not None
+
+
+class ExportCancelled(RuntimeError):
+    """Raised when a full-resolution export is cancelled cooperatively."""
+
+
+@dataclass(frozen=True)
+class BandExportTask:
+    reference_path: Path
+    source_path: Path
+    band_index: int
+    band_count: int
+    bands_directory: Path
+    inverse_map: Optional[Callable[[np.ndarray], np.ndarray]]
+    display_range: Optional[tuple[float, float]] = None
+    subsample_factor: int = 1
+    output_bbox: Optional[tuple[int, int, int, int]] = None
+    source_bbox: Optional[tuple[int, int, int, int]] = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +139,8 @@ class RasterioSource:
         from rasterio.warp import reproject
 
         self._validate_channel(channel)
+        if factor < 1:
+            raise ValueError("Preview factor must be greater than or equal to 1")
         _, ref_height, ref_width = reference.info.shape_cyx
         out_shape = (max(1, ref_height // factor), max(1, ref_width // factor))
         destination = np.zeros(out_shape, dtype=np.float32)
@@ -201,6 +233,427 @@ def robust_contrast_limits(
     return float(low), float(high)
 
 
+def useful_data_bbox(
+    path: Path,
+    padding: int = CROP_PADDING_PIXELS,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[int, int, int, int]:
+    """Return padded (row start, row stop, column start, column stop) data bounds."""
+    import rasterio
+
+    if padding < 0:
+        raise ValueError("Crop padding must be greater than or equal to zero")
+    row_min: Optional[int] = None
+    row_max = 0
+    column_min: Optional[int] = None
+    column_max = 0
+    with rasterio.open(path) as source:
+        for _, window in source.block_windows(1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ExportCancelled("Export cancelled")
+            valid = np.zeros((int(window.height), int(window.width)), dtype=bool)
+            masks = source.read_masks(window=window)
+            for band_index, dtype_name in enumerate(source.dtypes):
+                values = source.read(band_index + 1, window=window)
+                band_valid = masks[band_index] > 0
+                if np.issubdtype(values.dtype, np.floating):
+                    band_valid &= np.isfinite(values)
+                dtype = np.dtype(dtype_name)
+                if np.issubdtype(dtype, np.integer):
+                    limits = np.iinfo(dtype)
+                    band_valid &= values != limits.min
+                    band_valid &= values != limits.max
+                else:
+                    limits = np.finfo(dtype)
+                    band_valid &= values != limits.min
+                    band_valid &= values != limits.max
+                nodata = source.nodatavals[band_index]
+                if nodata is not None:
+                    if np.isnan(nodata):
+                        band_valid &= ~np.isnan(values)
+                    else:
+                        band_valid &= values != nodata
+                valid |= band_valid
+            rows, columns = np.nonzero(valid)
+            if rows.size:
+                first_row = int(window.row_off) + int(rows.min())
+                last_row = int(window.row_off) + int(rows.max()) + 1
+                first_column = int(window.col_off) + int(columns.min())
+                last_column = int(window.col_off) + int(columns.max()) + 1
+                row_min = first_row if row_min is None else min(row_min, first_row)
+                row_max = max(row_max, last_row)
+                column_min = (
+                    first_column
+                    if column_min is None
+                    else min(column_min, first_column)
+                )
+                column_max = max(column_max, last_column)
+        if row_min is None or column_min is None:
+            raise ValueError(f"No valid raster data found in {Path(path).name}")
+        return (
+            max(0, row_min - padding),
+            min(source.height, row_max + padding),
+            max(0, column_min - padding),
+            min(source.width, column_max + padding),
+        )
+
+
+def transformed_source_bbox(
+    output_bbox: tuple[int, int, int, int],
+    inverse_map: Optional[Callable[[np.ndarray], np.ndarray]],
+    source_data_bbox: tuple[int, int, int, int],
+    margin: int = CROP_PADDING_PIXELS,
+    samples_per_axis: int = 65,
+) -> tuple[int, int, int, int]:
+    """Intersect a dense transformed FIXED ROI with one source's data crop."""
+    if inverse_map is None:
+        return output_bbox
+    row_start, row_stop, column_start, column_stop = output_bbox
+    ys = np.linspace(row_start, max(row_start, row_stop - 1), samples_per_axis)
+    xs = np.linspace(
+        column_start, max(column_start, column_stop - 1), samples_per_axis
+    )
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    mapped = np.asarray(
+        inverse_map(np.column_stack([grid_x.ravel(), grid_y.ravel()])),
+        dtype=np.float64,
+    )
+    mapped = mapped[np.isfinite(mapped).all(axis=1)]
+    if not mapped.size:
+        return (0, 0, 0, 0)
+    mapped_column_start = int(np.floor(mapped[:, 0].min())) - margin
+    mapped_column_stop = int(np.ceil(mapped[:, 0].max())) + 1 + margin
+    mapped_row_start = int(np.floor(mapped[:, 1].min())) - margin
+    mapped_row_stop = int(np.ceil(mapped[:, 1].max())) + 1 + margin
+    data_row_start, data_row_stop, data_column_start, data_column_stop = (
+        source_data_bbox
+    )
+    result = (
+        max(data_row_start, mapped_row_start),
+        min(data_row_stop, mapped_row_stop),
+        max(data_column_start, mapped_column_start),
+        min(data_column_stop, mapped_column_stop),
+    )
+    if result[0] >= result[1] or result[2] >= result[3]:
+        return (0, 0, 0, 0)
+    return result
+
+
+def _resolution_directory_name(subsample_factor: int) -> str:
+    if subsample_factor not in EXPORT_SUBSAMPLE_FACTORS:
+        raise ValueError("Export subsampling factor must be 1, 2, or 4")
+    return "FULL" if subsample_factor == 1 else f"SUBSAMPLE_{subsample_factor}"
+
+
+def _imagej_spatial_calibration(
+    path: Path,
+) -> Optional[tuple[float, float, str, int]]:
+    """Return pixels/unit X/Y, ImageJ unit, and TIFF resolution-unit code."""
+    import rasterio
+    from pyproj import CRS
+
+    with rasterio.open(path) as source:
+        if source.crs is None:
+            return None
+        transform = source.transform
+        pixel_width = float(np.hypot(transform.a, transform.d))
+        pixel_height = float(np.hypot(transform.b, transform.e))
+        crs = CRS.from_user_input(source.crs)
+    if pixel_width <= 0 or pixel_height <= 0:
+        return None
+    if crs.is_geographic:
+        # Geographic affine coordinates are angular; TIFF has no angular
+        # ResolutionUnit code, but ImageJ honors unit=degree in its description.
+        return 1.0 / pixel_width, 1.0 / pixel_height, "degree", 1
+    axis_info = crs.axis_info
+    if not axis_info or axis_info[0].unit_conversion_factor is None:
+        return None
+    metres_per_crs_unit = float(axis_info[0].unit_conversion_factor)
+    pixel_width_cm = pixel_width * metres_per_crs_unit * 100.0
+    pixel_height_cm = pixel_height * metres_per_crs_unit * 100.0
+    if pixel_width_cm <= 0 or pixel_height_cm <= 0:
+        return None
+    return 1.0 / pixel_width_cm, 1.0 / pixel_height_cm, "cm", 3
+
+
+def _write_imagej_display_ranges(
+    path: Path, ranges: Sequence[float]
+) -> None:
+    """Add Fiji display and spatial calibration without changing pixels."""
+    from fractions import Fraction
+
+    from tifffile import imagej_metadata_tag
+
+    values = tuple(float(value) for value in ranges)
+    if not values or len(values) % 2:
+        raise ValueError("ImageJ display ranges require min/max pairs")
+    calibration = _imagej_spatial_calibration(path)
+    with path.open("r+b") as stream:
+        header = stream.read(16)
+        if header[:2] == b"II":
+            byteorder = "<"
+        elif header[:2] == b"MM":
+            byteorder = ">"
+        else:
+            raise ValueError(f"Not a TIFF file: {path}")
+        version = struct.unpack(f"{byteorder}H", header[2:4])[0]
+        if version == 42:
+            count_format, offset_format = "H", "I"
+            count_size, entry_size, offset_size = 2, 12, 4
+            first_ifd_offset = struct.unpack(f"{byteorder}I", header[4:8])[0]
+            header_pointer_offset = 4
+        elif version == 43:
+            offset_bytes, reserved = struct.unpack(
+                f"{byteorder}HH", header[4:8]
+            )
+            if offset_bytes != 8 or reserved != 0:
+                raise ValueError(f"Unsupported BigTIFF header: {path}")
+            count_format, offset_format = "Q", "Q"
+            count_size, entry_size, offset_size = 8, 20, 8
+            first_ifd_offset = struct.unpack(f"{byteorder}Q", header[8:16])[0]
+            header_pointer_offset = 8
+        else:
+            raise ValueError(f"Unsupported TIFF version {version}: {path}")
+
+        stream.seek(first_ifd_offset)
+        entry_count = struct.unpack(
+            f"{byteorder}{count_format}", stream.read(count_size)
+        )[0]
+        entries = [stream.read(entry_size) for _ in range(entry_count)]
+        next_ifd = stream.read(offset_size)
+        entries = [
+            entry
+            for entry in entries
+            if struct.unpack(f"{byteorder}H", entry[:2])[0]
+            not in (
+                (270, 282, 283, 296, 50838, 50839)
+                if calibration is not None
+                else (270, 50838, 50839)
+            )
+        ]
+
+        stream.seek(0, os.SEEK_END)
+        new_entries: list[bytes] = []
+        description_lines = [
+            "ImageJ=1.54p",
+            "images=1",
+            "hyperstack=false",
+        ]
+        if calibration is not None:
+            description_lines.append(f"unit={calibration[2]}")
+        description_lines.extend(
+            (f"min={values[0]:.17g}", f"max={values[1]:.17g}")
+        )
+        description = ("\n".join(description_lines) + "\n").encode(
+            "ascii"
+        ) + b"\0"
+        padding = (-stream.tell()) % 8
+        if padding:
+            stream.write(b"\0" * padding)
+        description_offset = stream.tell()
+        stream.write(description)
+        if version == 42:
+            if description_offset > 0xFFFFFFFF:
+                raise OverflowError("ImageJ description exceeds classic TIFF offsets")
+            new_entries.append(
+                struct.pack(
+                    f"{byteorder}HHII",
+                    270,
+                    2,
+                    len(description),
+                    description_offset,
+                )
+            )
+        else:
+            new_entries.append(
+                struct.pack(
+                    f"{byteorder}HHQQ",
+                    270,
+                    2,
+                    len(description),
+                    description_offset,
+                )
+            )
+        for code, dtype, count, data, _ in imagej_metadata_tag(
+            {"Ranges": values}, byteorder
+        ):
+            padding = (-stream.tell()) % 8
+            if padding:
+                stream.write(b"\0" * padding)
+            data_offset = stream.tell()
+            stream.write(data)
+            if version == 42:
+                if data_offset > 0xFFFFFFFF:
+                    raise OverflowError("ImageJ metadata exceeds classic TIFF offsets")
+                new_entries.append(
+                    struct.pack(
+                        f"{byteorder}HHII", code, dtype, count, data_offset
+                    )
+                )
+            else:
+                new_entries.append(
+                    struct.pack(
+                        f"{byteorder}HHQQ", code, dtype, count, data_offset
+                    )
+                )
+
+        if calibration is not None:
+            x_resolution, y_resolution, _, resolution_unit = calibration
+            for code, resolution in (
+                (282, x_resolution),
+                (283, y_resolution),
+            ):
+                fraction = Fraction(resolution).limit_denominator(1_000_000_000)
+                numerator = fraction.numerator
+                denominator = fraction.denominator
+                if not (0 < numerator <= 0xFFFFFFFF and denominator <= 0xFFFFFFFF):
+                    raise OverflowError("ImageJ pixel resolution exceeds TIFF RATIONAL")
+                rational = struct.pack(
+                    f"{byteorder}II", numerator, denominator
+                )
+                if version == 42:
+                    padding = (-stream.tell()) % 8
+                    if padding:
+                        stream.write(b"\0" * padding)
+                    rational_offset = stream.tell()
+                    stream.write(rational)
+                    if rational_offset > 0xFFFFFFFF:
+                        raise OverflowError(
+                            "ImageJ resolution exceeds classic TIFF offsets"
+                        )
+                    new_entries.append(
+                        struct.pack(
+                            f"{byteorder}HHII",
+                            code,
+                            5,
+                            1,
+                            rational_offset,
+                        )
+                    )
+                else:
+                    new_entries.append(
+                        struct.pack(f"{byteorder}HHQ", code, 5, 1) + rational
+                    )
+            if version == 42:
+                unit_value = struct.pack(
+                    f"{byteorder}H", resolution_unit
+                ) + b"\0\0"
+                new_entries.append(
+                    struct.pack(f"{byteorder}HHI", 296, 3, 1) + unit_value
+                )
+            else:
+                unit_value = struct.pack(
+                    f"{byteorder}H", resolution_unit
+                ) + b"\0" * 6
+                new_entries.append(
+                    struct.pack(f"{byteorder}HHQ", 296, 3, 1) + unit_value
+                )
+
+        padding = (-stream.tell()) % 8
+        if padding:
+            stream.write(b"\0" * padding)
+        new_ifd_offset = stream.tell()
+        all_entries = sorted(
+            entries + new_entries,
+            key=lambda entry: struct.unpack(f"{byteorder}H", entry[:2])[0],
+        )
+        stream.write(struct.pack(f"{byteorder}{count_format}", len(all_entries)))
+        for entry in all_entries:
+            stream.write(entry)
+        stream.write(next_ifd)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+        # Activate the complete replacement IFD last. Pixel offsets and bytes
+        # referenced by its copied entries are unchanged.
+        stream.seek(header_pointer_offset)
+        stream.write(struct.pack(f"{byteorder}{offset_format}", new_ifd_offset))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _read_imagej_display_ranges(path: Path) -> Optional[tuple[float, ...]]:
+    """Read Fiji display hints, if present, without loading raster pixels."""
+    from tifffile import TiffFile
+
+    with TiffFile(path) as tif:
+        metadata = tif.pages.first.tags.valueof(50839) or {}
+        ranges = metadata.get("Ranges")
+    if ranges is None:
+        return None
+    return tuple(float(value) for value in ranges)
+
+
+def _registration_signature(payload: dict[str, Any]) -> str:
+    """Return a deterministic fingerprint of export-relevant state."""
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _pair_registration_signature(
+    fixed_path: Path,
+    moving_path: Path,
+    pairs: Sequence[LandmarkPair],
+) -> str:
+    return _registration_signature(
+        {
+            "kind": "pair",
+            "reference_path": str(fixed_path.resolve()),
+            "moving_path": str(moving_path.resolve()),
+            "landmarks": [
+                {
+                    "pair_id": pair.pair_id,
+                    "fixed_yx": pair.fixed_yx,
+                    "moving_yx": pair.moving_yx,
+                }
+                for pair in complete_enabled_pairs(pairs)
+            ],
+        }
+    )
+
+
+def _series_registration_signature(
+    project: dict[str, Any], reference_path: Path
+) -> str:
+    registrations = []
+    for item in project.get("registrations", []):
+        session = item.get("session", {})
+        landmarks = [
+            {
+                "pair_id": int(pair["pair_id"]),
+                "fixed_yx": pair["fixed_yx"],
+                "moving_yx": pair["moving_yx"],
+            }
+            for pair in session.get("landmarks_full_resolution_yx", [])
+            if bool(pair.get("enabled", True))
+            and pair.get("fixed_yx") is not None
+            and pair.get("moving_yx") is not None
+        ]
+        registrations.append(
+            {
+                "fixed_path": str(Path(item["fixed_path"]).resolve()),
+                "moving_path": str(Path(item["moving_path"]).resolve()),
+                "landmarks": landmarks,
+            }
+        )
+    registrations.sort(
+        key=lambda item: (item["fixed_path"], item["moving_path"])
+    )
+    return _registration_signature(
+        {
+            "kind": "series",
+            "reference_path": str(reference_path.resolve()),
+            "images": sorted(
+                str(Path(item["path"]).resolve())
+                for item in project.get("images", [])
+            ),
+            "registrations": registrations,
+        }
+    )
+
+
 def yx_to_xy(points_yx: np.ndarray) -> np.ndarray:
     """Convert napari (row, column) coordinates to skimage (x, y)."""
     points = np.asarray(points_yx, dtype=np.float64)
@@ -240,6 +693,16 @@ class PixelGeoreferenceMap:
         self.source_crs = source.crs
         self.target_crs = target.crs
         self._crs_transformer: Optional[Any] = None
+        if (
+            self.source_crs is not None
+            and self.target_crs is not None
+            and self.source_crs != self.target_crs
+        ):
+            from pyproj import Transformer
+
+            self._crs_transformer = Transformer.from_crs(
+                self.source_crs, self.target_crs, always_xy=True
+            )
 
     def __call__(self, coordinates_xy: np.ndarray) -> np.ndarray:
         coordinates = np.asarray(coordinates_xy, dtype=np.float64)
@@ -253,12 +716,7 @@ class PixelGeoreferenceMap:
             and self.target_crs is not None
             and self.source_crs != self.target_crs
         ):
-            if self._crs_transformer is None:
-                from pyproj import Transformer
-
-                self._crs_transformer = Transformer.from_crs(
-                    self.source_crs, self.target_crs, always_xy=True
-                )
+            assert self._crs_transformer is not None
             world_x, world_y = self._crs_transformer.transform(world_x, world_y)
         inverse = self.target_inverse_transform
         target_columns = inverse.a * world_x + inverse.b * world_y + inverse.c
@@ -429,6 +887,7 @@ def export_full_resolution_tps(
     output_path: Path,
     fixed_points_yx: np.ndarray,
     moving_points_yx: np.ndarray,
+    contrast_percentiles: tuple[float, float] = DEFAULT_PERCENTILES,
 ) -> str:
     """Warp each moving band independently onto the fixed raster grid."""
     import rasterio
@@ -452,8 +911,10 @@ def export_full_resolution_tps(
             dtype=moving.dtypes[0],
             nodata=moving.nodata,
             compress="deflate",
-            tiled=True,
+            tiled=False,
         )
+        profile.pop("blockxsize", None)
+        profile.pop("blockysize", None)
         dtype = np.dtype(moving.dtypes[0])
         with rasterio.open(output_path, "w", **profile) as destination:
             for band_index in range(1, moving.count + 1):
@@ -480,6 +941,12 @@ def export_full_resolution_tps(
                 FIXED_IMAGE=str(Path(fixed_path).resolve()),
                 MOVING_IMAGE=str(Path(moving_path).resolve()),
             )
+    ranges = [
+        value
+        for channel in range(moving_source.info.shape_cyx[0])
+        for value in moving_source.sample_contrast(channel, contrast_percentiles)
+    ]
+    _write_imagej_display_ranges(output_path, ranges)
     return str(output_path)
 
 
@@ -524,44 +991,132 @@ def _session_staged_inverse_map(
     return model
 
 
-def _write_registered_band_files(
-    reference_path: Path,
+def _band_output_path(task: BandExportTask) -> Path:
+    return (
+        task.bands_directory
+        / f"{task.source_path.stem}_B{task.band_index:02d}_registered.tif"
+    )
+
+
+def _source_display_ranges(
     source_path: Path,
-    bands_directory: Path,
-    inverse_map: Optional[Callable[[np.ndarray], np.ndarray]],
-) -> list[str]:
-    """Write each source band as one 2-D raster on the reference grid."""
+    percentiles: tuple[float, float],
+) -> list[tuple[float, float]]:
+    source = RasterioSource(source_path)
+    return [
+        source.sample_contrast(channel, percentiles)
+        for channel in range(source.info.shape_cyx[0])
+    ]
+
+
+def _write_registered_band_task(
+    task: BandExportTask,
+    cancel_event: threading.Event,
+    block_completed: Callable[[BandExportTask], None],
+) -> tuple[Path, Path]:
+    """Compute one true 2-D band into a temporary GeoTIFF."""
     import rasterio
+    from affine import Affine
+    from rasterio.enums import Resampling
+    from rasterio.windows import Window
     from skimage.transform import warp
 
-    bands_directory.mkdir(parents=True, exist_ok=True)
-    outputs: list[str] = []
-    with rasterio.open(reference_path) as reference, rasterio.open(source_path) as source:
-        dtype = np.dtype(source.dtypes[0])
-        for band_index in range(1, source.count + 1):
-            output_path = (
-                bands_directory
-                / f"{source_path.stem}_B{band_index:02d}_registered.tif"
+    if cancel_event.is_set():
+        raise ExportCancelled("Export cancelled")
+    final_path = _band_output_path(task)
+    temporary_path = final_path.with_suffix(final_path.suffix + ".partial")
+    task.bands_directory.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(task.reference_path) as reference, rasterio.open(
+        task.source_path
+    ) as source:
+        if task.inverse_map is None and task.output_bbox is None and (
+            source.height != reference.height or source.width != reference.width
+        ):
+            raise ValueError(
+                "The reference image dimensions changed during series export"
             )
-            profile = reference.profile.copy()
-            profile.update(
-                count=1,
-                dtype=source.dtypes[0],
-                nodata=source.nodata,
-                compress="deflate",
+        factor = int(task.subsample_factor)
+        if factor not in EXPORT_SUBSAMPLE_FACTORS:
+            raise ValueError("Export subsampling factor must be 1, 2, or 4")
+        output_bbox = task.output_bbox or (0, reference.height, 0, reference.width)
+        row_start, row_stop, column_start, column_stop = output_bbox
+        output_height = max(1, int(np.ceil((row_stop - row_start) / factor)))
+        output_width = max(1, int(np.ceil((column_stop - column_start) / factor)))
+        source_bbox = task.source_bbox or (0, source.height, 0, source.width)
+        source_row_start, source_row_stop, source_column_start, source_column_stop = (
+            source_bbox
+        )
+        source_crop_empty = (
+            source_row_start >= source_row_stop
+            or source_column_start >= source_column_stop
+        )
+        source_crop_height = source_row_stop - source_row_start
+        source_crop_width = source_column_stop - source_column_start
+        downsampled_source_height = max(
+            1, int(np.ceil(source_crop_height / factor))
+        )
+        downsampled_source_width = max(
+            1, int(np.ceil(source_crop_width / factor))
+        )
+        source_scale_y = source_crop_height / downsampled_source_height
+        source_scale_x = source_crop_width / downsampled_source_width
+        dtype = np.dtype(source.dtypes[task.band_index - 1])
+        fill_value = 0 if source.nodata is None else source.nodata
+        profile = reference.profile.copy()
+        profile.update(
+            count=1,
+            dtype=dtype.name,
+            nodata=source.nodata,
+            compress="deflate",
+            tiled=False,
+            height=output_height,
+            width=output_width,
+            transform=(
+                reference.transform
+                * Affine.translation(column_start, row_start)
+                * Affine.scale(factor, factor)
+            ),
+        )
+        profile.pop("blockxsize", None)
+        profile.pop("blockysize", None)
+        raw = None
+        if task.inverse_map is not None and not source_crop_empty:
+            raw = source.read(
+                task.band_index,
+                window=Window(
+                    source_column_start,
+                    source_row_start,
+                    source_column_stop - source_column_start,
+                    source_row_stop - source_row_start,
+                ),
+                out_shape=(downsampled_source_height, downsampled_source_width),
+                resampling=Resampling.average,
             )
-            with rasterio.open(output_path, "w", **profile) as destination:
-                raw = None if inverse_map is None else source.read(band_index)
-                if inverse_map is None and (
-                    source.height != reference.height
-                    or source.width != reference.width
-                ):
-                    raise ValueError(
-                        "The reference image dimensions changed during series export"
-                    )
+        try:
+            with rasterio.open(temporary_path, "w", **profile) as destination:
                 for _, window in destination.block_windows(1):
-                    if inverse_map is None:
-                        registered = source.read(band_index, window=window)
+                    if cancel_event.is_set():
+                        raise ExportCancelled("Export cancelled")
+                    if task.inverse_map is None:
+                        registered = source.read(
+                            task.band_index,
+                            window=Window(
+                                column_start + float(window.col_off) * factor,
+                                row_start + float(window.row_off) * factor,
+                                float(window.width) * factor,
+                                float(window.height) * factor,
+                            ),
+                            out_shape=(int(window.height), int(window.width)),
+                            resampling=Resampling.average,
+                            boundless=True,
+                            fill_value=fill_value,
+                        )
+                    elif raw is None:
+                        registered = np.full(
+                            (int(window.height), int(window.width)),
+                            fill_value,
+                            dtype=dtype,
+                        )
                     else:
                         column_offset = float(window.col_off)
                         row_offset = float(window.row_off)
@@ -574,9 +1129,36 @@ def _write_registered_band_files(
                             coordinates_xy = np.asarray(
                                 coordinates_xy, dtype=np.float64
                             ).copy()
-                            coordinates_xy[:, 0] += column_offset
-                            coordinates_xy[:, 1] += row_offset
-                            return inverse_map(coordinates_xy)
+                            coordinates_xy[:, 0] = (
+                                column_start
+                                + (
+                                    coordinates_xy[:, 0]
+                                    + column_offset
+                                    + 0.5
+                                )
+                                * factor
+                                - 0.5
+                            )
+                            coordinates_xy[:, 1] = (
+                                row_start
+                                + (
+                                    coordinates_xy[:, 1]
+                                    + row_offset
+                                    + 0.5
+                                )
+                                * factor
+                                - 0.5
+                            )
+                            mapped = np.asarray(
+                                task.inverse_map(coordinates_xy), dtype=np.float64
+                            ).copy()
+                            mapped[:, 0] = (
+                                mapped[:, 0] - source_column_start + 0.5
+                            ) / source_scale_x - 0.5
+                            mapped[:, 1] = (
+                                mapped[:, 1] - source_row_start + 0.5
+                            ) / source_scale_y - 0.5
+                            return mapped
 
                         registered = warp(
                             raw,
@@ -584,7 +1166,7 @@ def _write_registered_band_files(
                             output_shape=(int(window.height), int(window.width)),
                             order=1,
                             mode="constant",
-                            cval=0 if source.nodata is None else source.nodata,
+                            cval=fill_value,
                             preserve_range=True,
                         )
                         if np.issubdtype(dtype, np.integer):
@@ -594,29 +1176,463 @@ def _write_registered_band_files(
                             )
                         registered = registered.astype(dtype, copy=False)
                     destination.write(registered, 1, window=window)
-                description = source.descriptions[band_index - 1]
+                    block_completed(task)
+                description = source.descriptions[task.band_index - 1]
                 destination.set_band_description(
-                    1, description or f"{source_path.name} band {band_index}"
+                    1,
+                    description
+                    or f"{task.source_path.name} band {task.band_index}",
                 )
                 destination.update_tags(
                     REGISTRATION=(
-                        "reference_copy" if inverse_map is None else "manual_series_tps"
+                        "reference_copy"
+                        if task.inverse_map is None
+                        else "manual_series_tps"
                     ),
-                    REFERENCE_IMAGE=str(reference_path.resolve()),
-                    SOURCE_IMAGE=str(source_path.resolve()),
-                    SOURCE_BAND=str(band_index),
+                    REFERENCE_IMAGE=str(task.reference_path.resolve()),
+                    SOURCE_IMAGE=str(task.source_path.resolve()),
+                    SOURCE_BAND=str(task.band_index),
+                    SUBSAMPLE_FACTOR=str(factor),
+                    FIXED_CROP_BBOX=",".join(str(value) for value in output_bbox),
+                    SOURCE_CROP_BBOX=",".join(str(value) for value in source_bbox),
                 )
-            outputs.append(str(output_path))
-    return outputs
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
+    if task.display_range is not None:
+        _write_imagej_display_ranges(temporary_path, task.display_range)
+    return temporary_path, final_path
+
+
+def _assemble_multiband(
+    source_path: Path,
+    band_paths: Sequence[Path],
+    multiband_directory: Path,
+    cancel_event: threading.Event,
+    display_ranges: Optional[Sequence[float]] = None,
+) -> tuple[Path, Path]:
+    """Assemble completed 2-D files into one all-bands GeoTIFF."""
+    import rasterio
+
+    if cancel_event.is_set():
+        raise ExportCancelled("Export cancelled")
+    multiband_directory.mkdir(parents=True, exist_ok=True)
+    final_path = multiband_directory / f"{source_path.stem}_registered_all_bands.tif"
+    temporary_path = final_path.with_suffix(final_path.suffix + ".partial")
+    try:
+        with rasterio.open(band_paths[0]) as first:
+            profile = first.profile.copy()
+            profile.update(count=len(band_paths), compress="deflate")
+            if not profile.get("tiled", False):
+                profile.pop("blockxsize", None)
+                profile.pop("blockysize", None)
+        with rasterio.open(temporary_path, "w", **profile) as destination:
+            for band_index, band_path in enumerate(band_paths, start=1):
+                if cancel_event.is_set():
+                    raise ExportCancelled("Export cancelled")
+                with rasterio.open(band_path) as source:
+                    for _, window in source.block_windows(1):
+                        if cancel_event.is_set():
+                            raise ExportCancelled("Export cancelled")
+                        destination.write(
+                            source.read(1, window=window), band_index, window=window
+                        )
+                    destination.set_band_description(
+                        band_index,
+                        source.descriptions[0]
+                        or f"{source_path.name} band {band_index}",
+                    )
+                    destination.update_tags(
+                        band_index,
+                        SOURCE_IMAGE=str(source_path.resolve()),
+                        SOURCE_BAND=str(band_index),
+                    )
+            destination.update_tags(SOURCE_IMAGE=str(source_path.resolve()))
+        if display_ranges is not None:
+            _write_imagej_display_ranges(temporary_path, display_ranges)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return temporary_path, final_path
+
+
+def _run_band_tasks(
+    tasks: Sequence[BandExportTask],
+    worker_count: int,
+    cancel_event: threading.Event,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]],
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Run independent bands concurrently, then assemble per-image stacks."""
+    import rasterio
+
+    if not tasks:
+        return {}, {}
+    with rasterio.open(tasks[0].reference_path) as reference:
+        blocks_per_band = sum(1 for _ in reference.block_windows(1))
+        reference_area = reference.height * reference.width
+        output_bbox = tasks[0].output_bbox or (
+            0,
+            reference.height,
+            0,
+            reference.width,
+        )
+    factor = tasks[0].subsample_factor
+    output_area = max(
+        1, int(np.ceil((output_bbox[1] - output_bbox[0]) / factor))
+    ) * max(1, int(np.ceil((output_bbox[3] - output_bbox[2]) / factor)))
+    estimated_blocks_per_band = max(
+        1, int(np.ceil(blocks_per_band * output_area / reference_area))
+    )
+    total_blocks = estimated_blocks_per_band * len(tasks)
+    completed_blocks = 0
+    completed_bands = 0
+    active_bands = 0
+    warped_completed = 0
+    copied_completed = 0
+    warped_total = sum(task.inverse_map is not None for task in tasks)
+    copied_total = len(tasks) - warped_total
+    recent_warp_durations: list[float] = []
+    progress_lock = threading.Lock()
+
+    def report_progress(task: BandExportTask, event: str) -> None:
+        with progress_lock:
+            snapshot = {
+                "phase": "warp",
+                "event": event,
+                "completed": completed_bands,
+                "total": len(tasks),
+                "active": active_bands,
+                "warped_completed": warped_completed,
+                "warped_total": warped_total,
+                "copied_completed": copied_completed,
+                "copied_total": copied_total,
+                "blocks_completed": completed_blocks,
+                "blocks_total": total_blocks,
+                "image": task.source_path.name,
+                "band": task.band_index,
+                "band_count": task.band_count,
+                "task_kind": "warp" if task.inverse_map is not None else "copy",
+                "subsample_factor": task.subsample_factor,
+            }
+            if recent_warp_durations and warped_completed < warped_total:
+                average_duration = sum(recent_warp_durations) / len(
+                    recent_warp_durations
+                )
+                remaining_waves = (warped_total - warped_completed) / worker_count
+                snapshot["eta_seconds"] = average_duration * remaining_waves
+        if progress_callback is not None:
+            progress_callback(snapshot)
+
+    def block_completed(task: BandExportTask) -> None:
+        nonlocal completed_blocks
+        with progress_lock:
+            completed_blocks += 1
+            current = completed_blocks
+        report_interval = max(1, total_blocks // 200)
+        if current % report_interval == 0:
+            report_progress(task, "activity")
+
+    def run_task(task: BandExportTask) -> tuple[Path, Path, float]:
+        nonlocal active_bands
+        with progress_lock:
+            active_bands += 1
+        report_progress(task, "started")
+        started_at = monotonic()
+        try:
+            temporary_path, final_path = _write_registered_band_task(
+                task,
+                cancel_event,
+                block_completed,
+            )
+            return temporary_path, final_path, monotonic() - started_at
+        finally:
+            with progress_lock:
+                active_bands -= 1
+
+    effective_worker_count = max(
+        1, min(int(worker_count), len(tasks), os.cpu_count() or 1)
+    )
+    worker_count = effective_worker_count
+    completed_files: list[tuple[Path, Path]] = []
+    try:
+        with ThreadPoolExecutor(max_workers=effective_worker_count) as executor:
+            futures = {
+                executor.submit(run_task, task): task
+                for task in tasks
+            }
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    temporary_path, final_path, duration = future.result()
+                    completed_files.append((temporary_path, final_path))
+                    with progress_lock:
+                        completed_bands += 1
+                        if task.inverse_map is None:
+                            copied_completed += 1
+                        else:
+                            warped_completed += 1
+                            recent_warp_durations.append(duration)
+                            del recent_warp_durations[:-10]
+                    report_progress(task, "completed")
+                except Exception:
+                    cancel_event.set()
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+        if cancel_event.is_set():
+            raise ExportCancelled("Export cancelled")
+
+        outputs: dict[str, list[str]] = {}
+        multiband_outputs: dict[str, str] = {}
+        completed_by_final = {
+            final_path: temporary_path
+            for temporary_path, final_path in completed_files
+        }
+        completed_multiband: list[tuple[Path, Path]] = []
+        sources = list(dict.fromkeys(task.source_path.resolve() for task in tasks))
+        for index, source_path in enumerate(sources, start=1):
+            source_tasks = sorted(
+                (task for task in tasks if task.source_path.resolve() == source_path),
+                key=lambda task: task.band_index,
+            )
+            final_band_paths = [_band_output_path(task) for task in source_tasks]
+            temporary_band_paths = [
+                completed_by_final[path] for path in final_band_paths
+            ]
+            outputs[str(source_path)] = [str(path) for path in final_band_paths]
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": "assemble",
+                        "image": source_path.name,
+                        "completed": index,
+                        "total": len(sources),
+                        "subsample_factor": tasks[0].subsample_factor,
+                    }
+                )
+            multiband_temporary, multiband_final = _assemble_multiband(
+                source_path,
+                temporary_band_paths,
+                tasks[0].bands_directory.parent / "MULTIBAND",
+                cancel_event,
+                [
+                    value
+                    for task in source_tasks
+                    if task.display_range is not None
+                    for value in task.display_range
+                ]
+                if all(task.display_range is not None for task in source_tasks)
+                else None,
+            )
+            completed_multiband.append((multiband_temporary, multiband_final))
+            multiband_outputs[str(source_path)] = str(multiband_final)
+
+        if cancel_event.is_set():
+            raise ExportCancelled("Export cancelled")
+        # Keep the previous completed export untouched until all warped bands
+        # and assembled products are ready.
+        for temporary_path, final_path in completed_files + completed_multiband:
+            temporary_path.replace(final_path)
+        return outputs, multiband_outputs
+    finally:
+        for temporary_path in tasks[0].bands_directory.glob("*.partial"):
+            temporary_path.unlink(missing_ok=True)
+        multiband_directory = tasks[0].bands_directory.parent / "MULTIBAND"
+        if multiband_directory.exists():
+            for temporary_path in multiband_directory.glob("*.partial"):
+                temporary_path.unlink(missing_ok=True)
+
+
+def _write_registered_band_files(
+    reference_path: Path,
+    source_path: Path,
+    bands_directory: Path,
+    inverse_map: Optional[Callable[[np.ndarray], np.ndarray]],
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    progress_offset: int = 0,
+    progress_total: int = 0,
+    contrast_percentiles: tuple[float, float] = DEFAULT_PERCENTILES,
+) -> list[str]:
+    """Compatibility wrapper that exports one image sequentially."""
+    import rasterio
+
+    del progress_offset, progress_total
+    display_ranges = _source_display_ranges(source_path, contrast_percentiles)
+    with rasterio.open(source_path) as source:
+        tasks = [
+            BandExportTask(
+                reference_path,
+                source_path,
+                band_index,
+                source.count,
+                bands_directory,
+                inverse_map,
+                display_ranges[band_index - 1],
+            )
+            for band_index in range(1, source.count + 1)
+        ]
+    outputs, _ = _run_band_tasks(
+        tasks, 1, threading.Event(), progress_callback
+    )
+    return outputs[str(source_path.resolve())]
+
+
+def _save_export_manifest(result: dict[str, Any]) -> Path:
+    """Persist a completed export atomically for discovery in later sessions."""
+    output_directory = Path(result["output_directory"]).resolve()
+    state_directory = output_directory / "STATE"
+    state_directory.mkdir(parents=True, exist_ok=True)
+    manifest_path = state_directory / EXPORT_MANIFEST_FILENAME
+    payload = {
+        "format": "phenolapseuav-export",
+        "version": 3,
+        "result": result,
+    }
+    resolution = result.get(
+        "resolution",
+        _resolution_directory_name(int(result.get("subsample_factor", 1))),
+    )
+    manifest_text = json.dumps(payload, indent=2, sort_keys=True)
+    for path in (
+        manifest_path,
+        state_directory / "EXPORTS" / f"{resolution}.json",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        temporary_path.write_text(manifest_text, encoding="utf-8")
+        temporary_path.replace(path)
+    return manifest_path
+
+
+def _load_export_manifest_path(manifest_path: Path) -> Optional[dict[str, Any]]:
+    """Load one manifest only when every recorded output still exists."""
+    if not manifest_path.is_file():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if payload.get("format") != "phenolapseuav-export":
+            return None
+        result = payload["result"]
+        paths = [
+            Path(path)
+            for image_outputs in result["outputs"].values()
+            for path in image_outputs
+        ]
+        paths.extend(Path(path) for path in result.get("multiband_outputs", {}).values())
+        if not paths or not all(path.is_file() for path in paths):
+            return None
+        return result
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _load_export_manifest(output_directory: Path) -> Optional[dict[str, Any]]:
+    """Return the most recent completed export for backward compatibility."""
+    output_directory = output_directory.resolve()
+    manifest_path = output_directory / "STATE" / EXPORT_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        manifest_path = output_directory / EXPORT_MANIFEST_FILENAME
+    return _load_export_manifest_path(manifest_path)
+
+
+def _load_resolution_export_manifests(
+    output_directory: Path,
+    registration_signature: Optional[str] = None,
+) -> dict[str, dict[str, Any]]:
+    """Return all complete resolution exports, optionally filtering stale ones."""
+    output_directory = output_directory.resolve()
+    results: dict[str, dict[str, Any]] = {}
+    exports_directory = output_directory / "STATE" / "EXPORTS"
+    for manifest_path in sorted(exports_directory.glob("*.json")):
+        result = _load_export_manifest_path(manifest_path)
+        if result is None:
+            continue
+        if (
+            registration_signature is not None
+            and result.get("registration_signature") != registration_signature
+        ):
+            continue
+        resolution = result.get("resolution")
+        if resolution in {"FULL", "SUBSAMPLE_2", "SUBSAMPLE_4"}:
+            results[resolution] = result
+    latest = _load_export_manifest(output_directory)
+    if latest is not None:
+        resolution = latest.get("resolution")
+        if (
+            resolution in {"FULL", "SUBSAMPLE_2", "SUBSAMPLE_4"}
+            and (
+                registration_signature is None
+                or latest.get("registration_signature") == registration_signature
+            )
+        ):
+            results.setdefault(resolution, latest)
+    return results
+
+
+def _prepare_export_geometry(
+    reference_path: Path,
+    image_paths: Sequence[Path],
+    mappings: dict[Path, Optional[Callable[[np.ndarray], np.ndarray]]],
+    crop_to_data: bool,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[
+    tuple[int, int, int, int],
+    dict[Path, tuple[int, int, int, int]],
+]:
+    """Compute the shared FIXED output crop and bounded per-source crops."""
+    import rasterio
+
+    reference_path = reference_path.resolve()
+    with rasterio.open(reference_path) as reference:
+        full_reference_bbox = (0, reference.height, 0, reference.width)
+    if not crop_to_data:
+        source_bboxes: dict[Path, tuple[int, int, int, int]] = {}
+        for image_path in image_paths:
+            resolved = image_path.resolve()
+            with rasterio.open(resolved) as source:
+                source_bboxes[resolved] = (0, source.height, 0, source.width)
+        return full_reference_bbox, source_bboxes
+
+    data_bboxes = {
+        image_path.resolve(): useful_data_bbox(
+            image_path, cancel_event=cancel_event
+        )
+        for image_path in image_paths
+    }
+    output_bbox = data_bboxes[reference_path]
+    source_bboxes = {
+        image_path.resolve(): transformed_source_bbox(
+            output_bbox,
+            mappings[image_path.resolve()],
+            data_bboxes[image_path.resolve()],
+        )
+        for image_path in image_paths
+    }
+    return output_bbox, source_bboxes
 
 
 def export_registration_series(
-    project: dict[str, Any], reference_path: Path, output_directory: Path
+    project: dict[str, Any],
+    reference_path: Path,
+    output_directory: Path,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    worker_count: int = 1,
+    cancel_event: Optional[threading.Event] = None,
+    contrast_percentiles: tuple[float, float] = DEFAULT_PERCENTILES,
+    registration_signature: Optional[str] = None,
+    subsample_factor: int = 1,
+    crop_to_data: bool = True,
 ) -> dict[str, Any]:
     """Export every image reachable from the reference through directed edges."""
     reference_path = reference_path.resolve()
     output_directory = output_directory.resolve()
-    bands_directory = output_directory / "BANDS"
+    resolution_name = _resolution_directory_name(subsample_factor)
+    bands_directory = (
+        output_directory
+        / REGISTERED_IMAGES_DIRECTORY
+        / resolution_name
+        / "BANDS"
+    )
     image_paths = [Path(item["path"]).resolve() for item in project.get("images", [])]
     if reference_path not in image_paths:
         image_paths.insert(0, reference_path)
@@ -662,31 +1678,65 @@ def export_registration_series(
             f"edges from {reference_path.name}. Unreachable: {names}.{suffix}"
         )
 
-    output_by_image: dict[str, list[str]] = {}
+    import rasterio
+
+    band_counts: dict[Path, int] = {}
+    display_ranges: dict[Path, list[tuple[float, float]]] = {}
     for image_path in image_paths:
-        if image_path not in mappings:
-            continue
-        output_by_image[str(image_path)] = _write_registered_band_files(
+        with rasterio.open(image_path) as source:
+            band_counts[image_path] = source.count
+        display_ranges[image_path] = _source_display_ranges(
+            image_path, contrast_percentiles
+        )
+    active_cancel_event = cancel_event or threading.Event()
+    output_bbox, source_bboxes = _prepare_export_geometry(
+        reference_path,
+        image_paths,
+        mappings,
+        crop_to_data,
+        active_cancel_event,
+    )
+    tasks = [
+        BandExportTask(
             reference_path,
             image_path,
+            band_index,
+            band_counts[image_path],
             bands_directory,
             mappings[image_path],
+            display_ranges[image_path][band_index - 1],
+            subsample_factor,
+            output_bbox,
+            source_bboxes[image_path],
         )
-
-    if len(output_by_image) < 2:
-        details = "; ".join(skipped_edges[:3])
-        suffix = f" ({details})" if details else ""
-        raise ValueError(
-            "No moving series image is reachable from the selected reference"
-            f"{suffix}"
-        )
-    return {
+        for image_path in image_paths
+        for band_index in range(1, band_counts[image_path] + 1)
+    ]
+    outputs, multiband_outputs = _run_band_tasks(
+        tasks,
+        worker_count,
+        active_cancel_event,
+        progress_callback,
+    )
+    result = {
         "output_directory": str(output_directory),
         "reference_path": str(reference_path),
-        "outputs": output_by_image,
+        "outputs": outputs,
+        "multiband_outputs": multiband_outputs,
         "unreachable": [],
         "skipped_edges": skipped_edges,
+        "registration_signature": registration_signature,
+        "contrast_percentiles": list(contrast_percentiles),
+        "subsample_factor": subsample_factor,
+        "resolution": resolution_name,
+        "crop_to_data": crop_to_data,
+        "output_bbox": list(output_bbox),
+        "source_bboxes": {
+            str(path): list(bbox) for path, bbox in source_bboxes.items()
+        },
     }
+    _save_export_manifest(result)
+    return result
 
 
 def export_registration_pair_bands(
@@ -695,6 +1745,13 @@ def export_registration_pair_bands(
     output_directory: Path,
     fixed_points_yx: np.ndarray,
     moving_points_yx: np.ndarray,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    worker_count: int = 1,
+    cancel_event: Optional[threading.Event] = None,
+    contrast_percentiles: tuple[float, float] = DEFAULT_PERCENTILES,
+    registration_signature: Optional[str] = None,
+    subsample_factor: int = 1,
+    crop_to_data: bool = True,
 ) -> dict[str, Any]:
     """Export a standalone FIXED/MOVING pair as separate 2-D band files."""
     if len(fixed_points_yx) < TPS_MIN_PAIRS:
@@ -707,22 +1764,82 @@ def export_registration_pair_bands(
         ),
     )
     output_directory = output_directory.resolve()
-    bands_directory = output_directory / "BANDS"
-    outputs = {
-        str(fixed_path.resolve()): _write_registered_band_files(
-            fixed_path, fixed_path, bands_directory, None
+    resolution_name = _resolution_directory_name(subsample_factor)
+    bands_directory = (
+        output_directory
+        / REGISTERED_IMAGES_DIRECTORY
+        / resolution_name
+        / "BANDS"
+    )
+    import rasterio
+
+    with rasterio.open(fixed_path) as reference:
+        fixed_band_count = reference.count
+    with rasterio.open(moving_path) as moving:
+        moving_band_count = moving.count
+    display_ranges = {
+        fixed_path.resolve(): _source_display_ranges(
+            fixed_path, contrast_percentiles
         ),
-        str(moving_path.resolve()): _write_registered_band_files(
-            fixed_path, moving_path, bands_directory, inverse_map
+        moving_path.resolve(): _source_display_ranges(
+            moving_path, contrast_percentiles
         ),
     }
-    return {
+    resolved_fixed = fixed_path.resolve()
+    resolved_moving = moving_path.resolve()
+    mappings = {resolved_fixed: None, resolved_moving: inverse_map}
+    active_cancel_event = cancel_event or threading.Event()
+    output_bbox, source_bboxes = _prepare_export_geometry(
+        resolved_fixed,
+        [resolved_fixed, resolved_moving],
+        mappings,
+        crop_to_data,
+        active_cancel_event,
+    )
+    tasks = [
+        BandExportTask(
+            fixed_path,
+            path,
+            band_index,
+            band_count,
+            bands_directory,
+            mapping,
+            display_ranges[path.resolve()][band_index - 1],
+            subsample_factor,
+            output_bbox,
+            source_bboxes[path.resolve()],
+        )
+        for path, band_count, mapping in (
+            (fixed_path, fixed_band_count, None),
+            (moving_path, moving_band_count, inverse_map),
+        )
+        for band_index in range(1, band_count + 1)
+    ]
+    outputs, multiband_outputs = _run_band_tasks(
+        tasks,
+        worker_count,
+        active_cancel_event,
+        progress_callback,
+    )
+    result = {
         "output_directory": str(output_directory),
         "reference_path": str(fixed_path.resolve()),
         "outputs": outputs,
+        "multiband_outputs": multiband_outputs,
         "unreachable": [],
         "skipped_edges": [],
+        "registration_signature": registration_signature,
+        "contrast_percentiles": list(contrast_percentiles),
+        "subsample_factor": subsample_factor,
+        "resolution": resolution_name,
+        "crop_to_data": crop_to_data,
+        "output_bbox": list(output_bbox),
+        "source_bboxes": {
+            str(path): list(bbox) for path, bbox in source_bboxes.items()
+        },
     }
+    _save_export_manifest(result)
+    return result
 
 
 def create_sample_result(
@@ -747,6 +1864,7 @@ def create_sample_result(
     arrays: list[np.ndarray] = []
     names: list[str] = []
     profiles: list[dict[str, Any]] = []
+    display_ranges: list[float] = []
     for path in first_band_paths:
         with rasterio.open(path) as source:
             fill_value = 0 if source.nodata is None else source.nodata
@@ -755,6 +1873,11 @@ def create_sample_result(
             )
             names.append(Path(path).stem)
             profiles.append(source.profile.copy())
+        imagej_ranges = _read_imagej_display_ranges(Path(path))
+        if imagej_ranges is not None and len(imagej_ranges) >= 2:
+            display_ranges.extend(imagej_ranges[:2])
+        else:
+            display_ranges.extend(robust_contrast_limits(arrays[-1]))
 
     common_dtype = np.result_type(*(array.dtype for array in arrays))
     stack = np.stack(
@@ -769,6 +1892,9 @@ def create_sample_result(
         transform=profile["transform"] * Affine.translation(column_offset, row_offset),
         compress="deflate",
     )
+    if not profile.get("tiled", False):
+        profile.pop("blockxsize", None)
+        profile.pop("blockysize", None)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(output_path, "w", **profile) as destination:
         destination.write(stack)
@@ -779,6 +1905,7 @@ def create_sample_result(
             SAMPLE_CENTER_X=str(column),
             SAMPLE_SIZE=str(size),
         )
+    _write_imagej_display_ranges(output_path, display_ranges)
     return str(output_path), stack, names
 
 
@@ -790,7 +1917,7 @@ class RegistrationController:
         viewer: Any,
         fixed_source: RasterioSource,
         moving_source: RasterioSource,
-        preview_factor: int = 4,
+        preview_factor: int = 8,
         percentiles: tuple[float, float] = DEFAULT_PERCENTILES,
     ) -> None:
         from qtpy.QtCore import QEvent, QObject, QPoint, Qt, QTimer
@@ -807,6 +1934,7 @@ class RegistrationController:
             QLabel,
             QMessageBox,
             QPushButton,
+            QSpinBox,
             QTableWidget,
             QTableWidgetItem,
             QVBoxLayout,
@@ -837,12 +1965,25 @@ class RegistrationController:
         self._display_forward_map: Optional[Any] = None
         self._active_workers: set[Any] = set()
         self._export_result: Optional[dict[str, Any]] = None
+        self._export_started_at: Optional[float] = None
+        self._export_progress_relay: Optional[Any] = None
+        self._export_cancel_event: Optional[threading.Event] = None
         self._sample_selecting = False
         self._sample_layer: Optional[Any] = None
         self._sample_reference_layer: Optional[Any] = None
         self._sample_reference_full_shape: Optional[tuple[int, int]] = None
         self._sample_reference_preview_shape: Optional[tuple[int, int]] = None
+        self._roi_exports: dict[str, dict[str, Any]] = {}
+        self._roi_shapefile_path: Optional[Path] = None
+        self._roi_regions: list[Any] = []
+        self._roi_reference_layer: Optional[Any] = None
+        self._roi_shapes_layer: Optional[Any] = None
+        self._roi_labels_layer: Optional[Any] = None
+        self._roi_viewing = False
+        self._roi_started_at: Optional[float] = None
+        self._roi_progress_relay: Optional[Any] = None
         self.session_changed_callbacks: list[Any] = []
+        self.standalone_state_path: Optional[Path] = None
 
         self.fixed_preview = fixed_source.read_preview(0, preview_factor)
         self.moving_preview = moving_source.read_preview(0, preview_factor)
@@ -978,6 +2119,16 @@ class RegistrationController:
         marker_row.addStretch(1)
         layout.addLayout(marker_row)
 
+        self.update_complete_pairs_only = QCheckBox(
+            "Update only after both points are placed"
+        )
+        self.update_complete_pairs_only.setChecked(True)
+        self.update_complete_pairs_only.setToolTip(
+            "When enabled, wait for both the FIXED and MOVING point before updating. "
+            "Deleting a point or pair always updates the view."
+        )
+        layout.addWidget(self.update_complete_pairs_only)
+
         percentile_row = QHBoxLayout()
         self.low_percentile = QComboBox()
         self.high_percentile = QComboBox()
@@ -1015,9 +2166,24 @@ class RegistrationController:
         save_button = QPushButton("Save state")
         save_button.clicked.connect(self.save_state)
         persistence_row.addWidget(save_button)
-        export_button = QPushButton("Apply / Export TPS")
-        export_button.clicked.connect(self.export_dialog)
-        persistence_row.addWidget(export_button)
+        self.export_button = QPushButton("Apply / Export TPS")
+        self.export_button.clicked.connect(self.export_dialog)
+        persistence_row.addWidget(self.export_button)
+        persistence_row.addWidget(QLabel("Workers"))
+        self.export_workers = QSpinBox()
+        self.export_workers.setRange(1, max(1, os.cpu_count() or 1))
+        self.export_workers.setValue(
+            min(DEFAULT_EXPORT_WORKERS, max(1, os.cpu_count() or 1))
+        )
+        self.export_workers.setToolTip(
+            "Parallel band workers. Each active warped band holds its required "
+            "source crop at the selected export resolution in memory."
+        )
+        persistence_row.addWidget(self.export_workers)
+        self.cancel_export_button = QPushButton("Stop export")
+        self.cancel_export_button.setEnabled(False)
+        self.cancel_export_button.clicked.connect(self._cancel_export)
+        persistence_row.addWidget(self.cancel_export_button)
         self.sample_button = QPushButton("Create 512×512 sample")
         self.sample_button.setEnabled(False)
         self.sample_button.setToolTip(
@@ -1026,6 +2192,72 @@ class RegistrationController:
         self.sample_button.clicked.connect(self._begin_sample_selection)
         persistence_row.addWidget(self.sample_button)
         layout.addLayout(persistence_row)
+
+        export_options_row = QHBoxLayout()
+        export_options_row.addWidget(QLabel("Export resolution"))
+        self.export_resolution = QComboBox()
+        self.export_resolution.addItem("Full resolution (×1)", 1)
+        self.export_resolution.addItem("Subsample ×2", 2)
+        self.export_resolution.addItem("Subsample ×4", 4)
+        self.export_resolution.setCurrentIndex(
+            self.export_resolution.findData(DEFAULT_EXPORT_SUBSAMPLE)
+        )
+        self.export_resolution.setToolTip(
+            "Subsample source imagery before applying the registration. "
+            "Each resolution is stored in its own output directory."
+        )
+        export_options_row.addWidget(self.export_resolution)
+        self.crop_export_to_data = QCheckBox("Crop export to useful data")
+        self.crop_export_to_data.setChecked(True)
+        self.crop_export_to_data.setToolTip(
+            "Crop the FIXED grid and every source to valid non-background data, "
+            "with a 5-pixel safety margin."
+        )
+        export_options_row.addWidget(self.crop_export_to_data)
+        export_options_row.addStretch(1)
+        layout.addLayout(export_options_row)
+
+        self.roi_group = QGroupBox("Shapefile ROI analysis")
+        roi_layout = QGridLayout(self.roi_group)
+        roi_layout.addWidget(QLabel("Registered resolution"), 0, 0)
+        self.roi_resolution = QComboBox()
+        self.roi_resolution.currentIndexChanged.connect(
+            self._roi_resolution_changed
+        )
+        roi_layout.addWidget(self.roi_resolution, 0, 1)
+        self.roi_load_button = QPushButton("Load ROI shapefile…")
+        self.roi_load_button.clicked.connect(self._choose_roi_shapefile)
+        roi_layout.addWidget(self.roi_load_button, 0, 2)
+        roi_layout.addWidget(QLabel("Unique region ID"), 1, 0)
+        self.roi_id_field = QComboBox()
+        self.roi_id_field.setToolTip(
+            "Only attributes containing one distinct, non-empty value per "
+            "polygon are listed. Each value names one patch folder."
+        )
+        roi_layout.addWidget(self.roi_id_field, 1, 1)
+        roi_layout.addWidget(QLabel("Region name"), 1, 2)
+        self.roi_name_field = QComboBox()
+        roi_layout.addWidget(self.roi_name_field, 1, 3)
+        self.roi_display_button = QPushButton("Display polygons")
+        self.roi_display_button.clicked.connect(self._display_roi_shapefile)
+        roi_layout.addWidget(self.roi_display_button, 1, 4)
+        roi_layout.addWidget(QLabel("Patch margin (pixels)"), 2, 0)
+        self.roi_margin = QSpinBox()
+        self.roi_margin.setRange(0, 10000)
+        self.roi_margin.setValue(5)
+        roi_layout.addWidget(self.roi_margin, 2, 1)
+        self.roi_statistics_button = QPushButton("Export ROI statistics")
+        self.roi_statistics_button.clicked.connect(
+            lambda: self._start_roi_analysis(True, False)
+        )
+        roi_layout.addWidget(self.roi_statistics_button, 2, 2)
+        self.roi_patches_button = QPushButton("Export ROI patches + masks")
+        self.roi_patches_button.clicked.connect(
+            lambda: self._start_roi_analysis(False, True)
+        )
+        roi_layout.addWidget(self.roi_patches_button, 2, 3, 1, 2)
+        self.roi_group.setEnabled(False)
+        layout.addWidget(self.roi_group)
 
         self._QTableWidgetItem = QTableWidgetItem
         self._QCheckBox = QCheckBox
@@ -1098,6 +2330,7 @@ class RegistrationController:
         self.fixed_centers.bind_key("Delete", self.delete_last_pair, overwrite=True)
         self.moving_centers.bind_key("Delete", self.delete_last_pair, overwrite=True)
         self.show_overlay()
+        self._restore_existing_export()
 
     @staticmethod
     def _mouse_button(event: Any) -> int:
@@ -1125,6 +2358,10 @@ class RegistrationController:
         """
         button = self._mouse_button(event)
         if button not in (1, 2, 3):
+            return
+        if self._roi_viewing:
+            # ROI layers are display-only. Leave mouse handling to napari so
+            # Space + drag and the standard pan/zoom interactions keep working.
             return
         if button == 2:
             event.handled = True
@@ -1270,39 +2507,48 @@ class RegistrationController:
     def _record_canvas_point(self, side: str, preview_yx: tuple[float, float]) -> None:
         """Store a click under an explicit ID without relying on layer context."""
         attr = "fixed_yx" if side == "fixed" else "moving_yx"
-        if self._pending_pair_id is not None:
-            pair_id = self._pending_pair_id
-            pair = self.pairs.setdefault(pair_id, LandmarkPair(pair_id))
-            if getattr(pair, attr) is not None:
-                pair_id = -1
-        else:
-            pair_id = -1
-        if pair_id < 0 and side == "moving":
+        pending = self.pairs.get(self._pending_pair_id)
+        if side == "moving":
             candidates = [
                 pair.pair_id
                 for pair in self.pairs.values()
                 if pair.fixed_yx is not None and pair.moving_yx is None
             ]
-            if not candidates:
-                candidates = [
-                    pair.pair_id
-                    for pair in self.pairs.values()
-                    if pair.moving_yx is None
-                ]
-        elif pair_id < 0:
-            candidates = [
+            if pending is not None and pending.pair_id in candidates:
+                pair_id = pending.pair_id
+            elif candidates:
+                pair_id = max(candidates)
+            else:
+                self.status.setText(
+                    "Right click ignored: place a red FIXED point with left click first."
+                )
+                self._show_canvas_message(
+                    "RIGHT CLICK IGNORED\nPlace FIXED first",
+                    "#ff5555",
+                )
+                return
+        else:
+            fixed_only = [
+                pair.pair_id
+                for pair in self.pairs.values()
+                if pair.fixed_yx is not None and pair.moving_yx is None
+            ]
+            missing_fixed = [
                 pair.pair_id
                 for pair in self.pairs.values()
                 if pair.fixed_yx is None
             ]
-        else:
-            candidates = []
-        if pair_id < 0:
-            if not candidates:
+            if pending is not None and not pending.complete:
+                pair_id = pending.pair_id
+            elif fixed_only:
+                # A second left click moves the unpaired FIXED point instead of
+                # creating another incomplete pair.
+                pair_id = max(fixed_only)
+            elif missing_fixed:
+                pair_id = min(missing_fixed)
+            else:
                 pair_id = self._next_id()
                 self.pairs[pair_id] = LandmarkPair(pair_id)
-            else:
-                pair_id = min(candidates)
         pair = self.pairs[pair_id]
         full_yx = preview_yx_to_full_yx(
             preview_yx, self._full_shape(side), self._preview_shape(side)
@@ -1318,7 +2564,10 @@ class RegistrationController:
                 self._pending_pair_id = None
             self._schedule_preview()
         else:
-            self._notify_session_changed()
+            if self.update_complete_pairs_only.isChecked():
+                self._notify_session_changed()
+            else:
+                self._schedule_preview(force=True)
             self._show_canvas_message(
                 f"Pair {pair_id}\nWaiting for {other}",
                 "#55dd66" if side == "fixed" else "#ff5555",
@@ -1355,7 +2604,8 @@ class RegistrationController:
             ids.append(candidate)
             seen.add(candidate)
 
-        for deleted_id in set(old_ids) - set(ids):
+        deleted_ids = set(old_ids) - set(ids)
+        for deleted_id in deleted_ids:
             pair = self.pairs.get(deleted_id)
             if pair is not None:
                 if side == "fixed":
@@ -1394,7 +2644,9 @@ class RegistrationController:
             self._suspend_events = False
         self._refresh_table()
         self._advance_fast_mode(side, ids)
-        self._schedule_preview()
+        self._schedule_preview(
+            force=bool(deleted_ids) or not self.update_complete_pairs_only.isChecked()
+        )
 
     def _id_for_new_point(self, side: str) -> int:
         if self._pending_pair_id is not None:
@@ -1435,12 +2687,50 @@ class RegistrationController:
         for callback in tuple(self.session_changed_callbacks):
             callback()
 
+    def _export_matches_current_registration(
+        self, result: dict[str, Any]
+    ) -> bool:
+        saved_signature = result.get("registration_signature")
+        if not saved_signature:
+            return False
+        reference_path = Path(result["reference_path"])
+        if self.series_widget.directory is not None and self.series_widget.images:
+            current_signature = _series_registration_signature(
+                self.series_widget.project_dict(), reference_path
+            )
+        else:
+            current_signature = _pair_registration_signature(
+                self.fixed_source.path,
+                self.moving_source.path,
+                list(self.pairs.values()),
+            )
+        return saved_signature == current_signature
+
+    def _current_registration_signature(self, reference_path: Path) -> str:
+        if self.series_widget.directory is not None and self.series_widget.images:
+            return _series_registration_signature(
+                self.series_widget.project_dict(), reference_path
+            )
+        return _pair_registration_signature(
+            self.fixed_source.path,
+            self.moving_source.path,
+            list(self.pairs.values()),
+        )
+
     def _schedule_preview(self, force: bool = False) -> None:
         fixed_count = len(self.fixed_points.data)
         moving_count = len(self.moving_points.data)
         complete = complete_enabled_pairs(list(self.pairs.values()))
         signature = self._preview_signature()
         self._notify_session_changed()
+        if self._export_result is not None and not self._export_matches_current_registration(
+            self._export_result
+        ):
+            self._export_result = None
+            self.sample_button.setEnabled(False)
+            self._roi_exports.clear()
+            self.roi_resolution.clear()
+            self.roi_group.setEnabled(False)
         if not force and signature == self._scheduled_preview_signature:
             return
         self._scheduled_preview_signature = signature
@@ -1477,7 +2767,7 @@ class RegistrationController:
         return getattr(canvas, "native", self.widget)
 
     def _show_canvas_message(self, text: str, border_color: str) -> None:
-        """Display a non-blocking message at the center of the canvas."""
+        """Display a non-blocking message centered at the top of the canvas."""
         self.canvas_message.setText(text)
         self.canvas_message.setStyleSheet(
             "background: rgba(20, 20, 20, 210); color: white; "
@@ -1490,7 +2780,7 @@ class RegistrationController:
         self.canvas_message.adjustSize()
         self.canvas_message.move(
             max(0, (parent.width() - self.canvas_message.width()) // 2),
-            max(0, (parent.height() - self.canvas_message.height()) // 2),
+            20,
         )
         self.canvas_message.raise_()
         self.canvas_message.show()
@@ -1506,8 +2796,13 @@ class RegistrationController:
             self._display_inverse_map = None
             self._display_forward_map = None
             self._set_preview_pending(False)
+            if self.canvas_message.text().startswith("RELOADING PREVIEWS"):
+                self.canvas_message.hide()
             if self._view_mode == "moving_registered":
                 self.show_moving()
+            self.status.setText(
+                f"Preview updated: georeference, factor {self.preview_factor}."
+            )
             return
         fixed_yx = np.asarray(
             [
@@ -1566,7 +2861,10 @@ class RegistrationController:
         elif self._view_mode == "overlay":
             self._resync_layers_from_pairs()
         self._set_preview_pending(False)
-        self.status.setText(f"Preview updated: {model_name}, generation {generation}.")
+        self.status.setText(
+            f"Preview updated: {model_name}, factor {self.preview_factor}, "
+            f"generation {generation}."
+        )
 
     def _preview_failed(self, error: Exception, generation: int) -> None:
         if generation != self._generation:
@@ -1606,6 +2904,7 @@ class RegistrationController:
             pending = self._pending_pair_id
             self._pending_pair_id = None
             self._fast_phase = "idle"
+            self._schedule_preview(force=True)
             self.status.setText(
                 f"Empty pair {pending} canceled. The table is empty."
             )
@@ -1619,7 +2918,7 @@ class RegistrationController:
             if self._pending_pair_id == pair_id:
                 self._pending_pair_id = None
         self._resync_layers_from_pairs()
-        self._schedule_preview()
+        self._schedule_preview(force=True)
         deleted = ", ".join(str(pair_id) for pair_id in sorted(pair_ids))
         self.status.setText(
             f"Pair(s) {deleted} deleted. Continue with red left click, then green right click."
@@ -1627,6 +2926,14 @@ class RegistrationController:
 
     def show_fixed(self, *_: Any) -> None:
         self._view_mode = "fixed"
+        self._roi_viewing = False
+        for layer in (
+            self._roi_reference_layer,
+            self._roi_shapes_layer,
+            self._roi_labels_layer,
+        ):
+            if layer is not None:
+                layer.visible = False
         if self._sample_layer is not None:
             self._sample_layer.visible = False
         if self._sample_reference_layer is not None:
@@ -1644,6 +2951,14 @@ class RegistrationController:
         # The individual green view uses exactly the same FIXED-grid raster as
         # the overlay, including georeferencing before the first landmark.
         self._view_mode = "moving_registered"
+        self._roi_viewing = False
+        for layer in (
+            self._roi_reference_layer,
+            self._roi_shapes_layer,
+            self._roi_labels_layer,
+        ):
+            if layer is not None:
+                layer.visible = False
         if self._sample_layer is not None:
             self._sample_layer.visible = False
         if self._sample_reference_layer is not None:
@@ -1660,6 +2975,14 @@ class RegistrationController:
 
     def show_overlay(self, *_: Any) -> None:
         self._view_mode = "overlay"
+        self._roi_viewing = False
+        for layer in (
+            self._roi_reference_layer,
+            self._roi_shapes_layer,
+            self._roi_labels_layer,
+        ):
+            if layer is not None:
+                layer.visible = False
         if self._sample_layer is not None:
             self._sample_layer.visible = False
         if self._sample_reference_layer is not None:
@@ -1688,6 +3011,62 @@ class RegistrationController:
         self.moving_image.data = self.moving_preview
         self._update_contrast()
         self._resync_layers_from_pairs()
+        self._schedule_preview(force=True)
+
+    def set_preview_factor(self, factor: int) -> None:
+        """Reload previews at a new resolution while preserving full-resolution landmarks."""
+        factor = int(factor)
+        if factor < 1:
+            raise ValueError("Preview factor must be greater than or equal to 1")
+        if factor == self.preview_factor:
+            return
+
+        old_shape = self.fixed_preview.shape
+        old_center = tuple(self.viewer.camera.center)
+        old_zoom = float(self.viewer.camera.zoom)
+        self.status.setText(f"Reloading previews with factor {factor}…")
+        self._show_canvas_message(
+            f"RELOADING PREVIEWS…\nSubsampling factor {factor}",
+            "#66bbff",
+        )
+
+        # Read into local variables first so a failed read leaves the current
+        # previews and factor untouched.
+        try:
+            fixed_preview = self.fixed_source.read_preview(self.fixed_channel, factor)
+            moving_preview = self.moving_source.read_preview(self.moving_channel, factor)
+        except Exception:
+            if self.canvas_message.text().startswith("RELOADING PREVIEWS"):
+                self.canvas_message.hide()
+            self.status.setText(
+                f"Preview reload failed; factor {self.preview_factor} remains active."
+            )
+            raise
+
+        self._generation += 1
+        self._preview_timer.stop()
+        self.preview_factor = factor
+        self.fixed_preview = fixed_preview
+        self.moving_preview = moving_preview
+        self.fixed_image.data = fixed_preview
+        self.moving_image.data = moving_preview
+        self.registered_image.data = np.zeros(fixed_preview.shape, dtype=np.float32)
+        self._display_inverse_map = None
+        self._display_forward_map = None
+        self._scheduled_preview_signature = ()
+        self._resync_layers_from_pairs()
+
+        # Keep approximately the same geographic field of view. Landmark
+        # coordinates are rebuilt from their full-resolution values above.
+        if len(old_center) >= 2 and old_shape[0] > 0 and old_shape[1] > 0:
+            center = list(old_center)
+            center[-2] *= fixed_preview.shape[0] / old_shape[0]
+            center[-1] *= fixed_preview.shape[1] / old_shape[1]
+            self.viewer.camera.center = tuple(center)
+            scale_y = old_shape[0] / fixed_preview.shape[0]
+            scale_x = old_shape[1] / fixed_preview.shape[1]
+            self.viewer.camera.zoom = old_zoom * float(np.sqrt(scale_y * scale_x))
+
         self._schedule_preview(force=True)
 
     def _update_contrast(self, *_: Any) -> None:
@@ -1919,6 +3298,7 @@ class RegistrationController:
         self.status.setText(
             f"Active edge: FIXED {fixed_path.name} → MOVING {moving_path.name}"
         )
+        self._restore_existing_export()
 
     def load_session_payload(
         self, payload: dict[str, Any], verify_paths: bool = True
@@ -1954,9 +3334,65 @@ class RegistrationController:
         self._resync_layers_from_pairs()
         self._schedule_preview()
 
+    def configure_standalone_state(self, state_path: Path) -> bool:
+        """Restore and continuously save one standalone FIXED/MOVING pair."""
+        self.standalone_state_path = state_path.resolve()
+        restored = False
+        state_error: Optional[Exception] = None
+        if self.standalone_state_path.is_file():
+            try:
+                payload = json.loads(
+                    self.standalone_state_path.read_text(encoding="utf-8")
+                )
+                self.load_session_payload(payload, verify_paths=True)
+                restored = True
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+                state_error = error
+        if self._save_standalone_state not in self.session_changed_callbacks:
+            self.session_changed_callbacks.append(self._save_standalone_state)
+        if state_error is None:
+            self._save_standalone_state()
+            if restored:
+                self.status.setText(
+                    f"Standalone pair restored: {self.standalone_state_path}"
+                )
+            else:
+                self.status.setText(
+                    f"Standalone pair state initialized: {self.standalone_state_path}"
+                )
+        else:
+            self.status.setText(
+                f"Standalone state not restored: {state_error}. "
+                "The existing file is preserved until the next landmark edit."
+            )
+        return restored
+
+    def _save_standalone_state(self) -> bool:
+        if self.standalone_state_path is None:
+            return False
+        try:
+            self.standalone_state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.standalone_state_path.with_suffix(
+                self.standalone_state_path.suffix + ".tmp"
+            )
+            temporary.write_text(
+                json.dumps(self.session_dict(), indent=2), encoding="utf-8"
+            )
+            temporary.replace(self.standalone_state_path)
+            return True
+        except OSError as error:
+            self.status.setText(f"Failed to save standalone state: {error}")
+            return False
+
     def save_state(self, *_: Any) -> None:
-        """Save all series edges and landmarks to the automatic OUTPUT file."""
-        self.series_widget.save_state()
+        """Save either the active series project or standalone pair."""
+        if self.series_widget.directory is not None:
+            self.series_widget.save_state()
+            return
+        if self._save_standalone_state():
+            self.status.setText(f"State saved: {self.standalone_state_path}")
+        else:
+            self.status.setText("No automatic state path is configured.")
 
     def load_json_dialog(self, *_: Any) -> None:
         filename, _ = self._QFileDialog.getOpenFileName(self.widget, "Load landmarks", "", "JSON (*.json)")
@@ -1972,6 +3408,10 @@ class RegistrationController:
 
     def export_dialog(self, *_: Any) -> None:
         from napari.qt.threading import create_worker
+        from qtpy.QtCore import QObject, Signal
+
+        class ExportProgressRelay(QObject):
+            progressed = Signal(object)
 
         complete = complete_enabled_pairs(list(self.pairs.values()))
         series_mode = (
@@ -1987,26 +3427,32 @@ class RegistrationController:
                 return
         else:
             reference_path = self.fixed_source.path
-        suggested_directory = (
-            self.series_widget.state_path.parent
-            if self.series_widget.state_path is not None
-            else self.moving_source.path.parent / "OUTPUT"
-        )
-        directory = self._QFileDialog.getExistingDirectory(
-            self.widget,
-            "Select registration output directory",
-            str(suggested_directory),
-        )
-        if not directory:
-            return
-        output_directory = Path(directory)
+        output_directory = self._automatic_output_directory()
+        output_directory.mkdir(parents=True, exist_ok=True)
+        progress_relay = ExportProgressRelay(self.widget)
+        progress_relay.progressed.connect(self._export_progress)
+        self._export_progress_relay = progress_relay
+        self._export_cancel_event = threading.Event()
+        worker_count = self.export_workers.value()
+        subsample_factor = int(self.export_resolution.currentData())
+        crop_to_data = self.crop_export_to_data.isChecked()
         if series_mode:
             project = self.series_widget.project_dict()
+            registration_signature = _series_registration_signature(
+                project, reference_path
+            )
             worker = create_worker(
                 export_registration_series,
                 project,
                 reference_path,
                 output_directory,
+                progress_relay.progressed.emit,
+                worker_count,
+                self._export_cancel_event,
+                self.percentiles,
+                registration_signature,
+                subsample_factor,
+                crop_to_data,
             )
         else:
             fixed_yx = np.asarray(
@@ -2015,6 +3461,11 @@ class RegistrationController:
             moving_yx = np.asarray(
                 [pair.moving_yx for pair in complete], dtype=np.float64
             )
+            registration_signature = _pair_registration_signature(
+                self.fixed_source.path,
+                self.moving_source.path,
+                complete,
+            )
             worker = create_worker(
                 export_registration_pair_bands,
                 self.fixed_source.path,
@@ -2022,15 +3473,549 @@ class RegistrationController:
                 output_directory,
                 fixed_yx,
                 moving_yx,
+                progress_relay.progressed.emit,
+                worker_count,
+                self._export_cancel_event,
+                self.percentiles,
+                registration_signature,
+                subsample_factor,
+                crop_to_data,
             )
         self._active_workers.add(worker)
         self._export_result = None
+        self._export_started_at = monotonic()
+        self.export_button.setEnabled(False)
+        self.export_workers.setEnabled(False)
+        self.export_resolution.setEnabled(False)
+        self.crop_export_to_data.setEnabled(False)
+        self.cancel_export_button.setEnabled(True)
         self.sample_button.setEnabled(False)
-        self.status.setText("Full-resolution TPS export in progress, band by band…")
+        self.status.setText(
+            f"Raster export ×{subsample_factor} starting with "
+            f"{worker_count} worker(s)…"
+        )
+        self._show_canvas_message(
+            f"RASTER EXPORT ×{subsample_factor}…\n"
+            "Detecting useful data and preparing files",
+            "#66bbff",
+        )
         worker.returned.connect(self._export_finished)
-        worker.errored.connect(lambda error: self._QMessageBox.critical(self.widget, "Export failed", str(error)))
+        worker.errored.connect(self._export_failed)
         worker.finished.connect(lambda: self._active_workers.discard(worker))
         worker.start()
+
+    def _cancel_export(self, *_: Any) -> None:
+        """Request cooperative cancellation after each active raster block."""
+        if self._export_cancel_event is None:
+            return
+        self._export_cancel_event.set()
+        self.cancel_export_button.setEnabled(False)
+        self.status.setText(
+            "Stopping export… Active workers will stop after their current block."
+        )
+        self._show_canvas_message(
+            "STOPPING EXPORT…\nWaiting for active blocks to finish",
+            "#ff9955",
+        )
+
+    def _automatic_output_directory(self) -> Path:
+        """Return the deterministic sibling output directory for current inputs."""
+        from series_registration import registered_output_directory
+
+        input_directory = (
+            self.series_widget.directory
+            if self.series_widget.directory is not None
+            else self.moving_source.path.parent
+        )
+        return registered_output_directory(input_directory)
+
+    def _export_pointer_path(self) -> Path:
+        return (
+            self._automatic_output_directory()
+            / "STATE"
+            / EXPORT_POINTER_FILENAME
+        )
+
+    def _remember_export(self, result: dict[str, Any]) -> None:
+        """Remember an arbitrary export directory beside the current project."""
+        pointer_path = self._export_pointer_path()
+        try:
+            pointer_path.parent.mkdir(parents=True, exist_ok=True)
+            pointer_path.write_text(
+                json.dumps(
+                    {"output_directory": result["output_directory"]}, indent=2
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            # The export itself remains valid and can still be discovered in
+            # the default output directory.
+            pass
+
+    def _refresh_roi_exports(self, output_directory: Path) -> None:
+        """Expose all complete, non-stale resolutions to the ROI selector."""
+        latest = _load_export_manifest(output_directory)
+        if latest is None:
+            self._roi_exports = {}
+        else:
+            signature = self._current_registration_signature(
+                Path(latest["reference_path"])
+            )
+            self._roi_exports = _load_resolution_export_manifests(
+                output_directory, signature
+            )
+        previous = self.roi_resolution.currentData()
+        self.roi_resolution.blockSignals(True)
+        self.roi_resolution.clear()
+        labels = {
+            "FULL": "Full resolution (×1)",
+            "SUBSAMPLE_2": "Subsample ×2",
+            "SUBSAMPLE_4": "Subsample ×4",
+        }
+        for resolution in ("FULL", "SUBSAMPLE_2", "SUBSAMPLE_4"):
+            if resolution in self._roi_exports:
+                self.roi_resolution.addItem(labels[resolution], resolution)
+        if previous is not None:
+            index = self.roi_resolution.findData(previous)
+            if index >= 0:
+                self.roi_resolution.setCurrentIndex(index)
+        self.roi_resolution.blockSignals(False)
+        self.roi_group.setEnabled(bool(self._roi_exports))
+        has_shapefile = self._roi_shapefile_path is not None
+        self.roi_display_button.setEnabled(has_shapefile)
+        self.roi_statistics_button.setEnabled(has_shapefile)
+        self.roi_patches_button.setEnabled(has_shapefile)
+
+    def _selected_roi_export(self) -> Optional[dict[str, Any]]:
+        resolution = self.roi_resolution.currentData()
+        return self._roi_exports.get(str(resolution))
+
+    def _roi_resolution_changed(self, *_: Any) -> None:
+        if self._roi_shapefile_path is not None:
+            self._display_roi_shapefile()
+
+    def _choose_roi_shapefile(self, *_: Any) -> None:
+        from roi_analysis import shapefile_fields, unique_shapefile_fields
+
+        filename, _ = self._QFileDialog.getOpenFileName(
+            self.widget, "Load ROI shapefile", "", "Shapefile (*.shp)"
+        )
+        if not filename:
+            return
+        try:
+            fields = shapefile_fields(Path(filename))
+            if not fields:
+                raise ValueError("The shapefile has no attribute fields")
+            unique_fields = unique_shapefile_fields(Path(filename))
+            if not unique_fields:
+                raise ValueError(
+                    "The shapefile has no non-empty attribute with one unique "
+                    "value per polygon. Add a unique region ID field before "
+                    "exporting patches."
+                )
+        except Exception as error:
+            self._QMessageBox.critical(
+                self.widget, "ROI shapefile failed", str(error)
+            )
+            return
+        self._roi_shapefile_path = Path(filename).resolve()
+        self.roi_id_field.clear()
+        self.roi_id_field.addItems(unique_fields)
+        self.roi_name_field.clear()
+        self.roi_name_field.addItems(fields)
+        preferred_id = next(
+            (
+                field
+                for field in unique_fields
+                if field.casefold() in {"id", "region_id", "plot_id"}
+            ),
+            unique_fields[0],
+        )
+        preferred_name = next(
+            (
+                field
+                for field in fields
+                if field.casefold() in {"name", "nom", "region_name"}
+            ),
+            fields[min(1, len(fields) - 1)],
+        )
+        self.roi_id_field.setCurrentText(preferred_id)
+        self.roi_name_field.setCurrentText(preferred_name)
+        self.roi_display_button.setEnabled(True)
+        self.roi_statistics_button.setEnabled(True)
+        self.roi_patches_button.setEnabled(True)
+        self._display_roi_shapefile()
+
+    def _remove_roi_layers(self) -> None:
+        for attribute in (
+            "_roi_reference_layer",
+            "_roi_shapes_layer",
+            "_roi_labels_layer",
+        ):
+            layer = getattr(self, attribute)
+            if layer is not None and layer in self.viewer.layers:
+                self.viewer.layers.remove(layer)
+            setattr(self, attribute, None)
+
+    def _display_roi_shapefile(self, *_: Any) -> None:
+        import rasterio
+
+        from roi_analysis import geometry_display_paths, load_shapefile_regions
+
+        result = self._selected_roi_export()
+        if result is None or self._roi_shapefile_path is None:
+            return
+        reference_key = str(Path(result["reference_path"]).resolve())
+        reference_outputs = result["outputs"].get(reference_key, [])
+        if not reference_outputs:
+            return
+        reference_path = Path(reference_outputs[0])
+        try:
+            with rasterio.open(reference_path) as reference:
+                regions = load_shapefile_regions(
+                    self._roi_shapefile_path,
+                    reference.crs,
+                    self.roi_id_field.currentText(),
+                    self.roi_name_field.currentText(),
+                )
+                full_shape = (reference.height, reference.width)
+                transform = reference.transform
+            reference_source = RasterioSource(reference_path)
+            preview = reference_source.read_preview(0, self.preview_factor)
+            stored_ranges = _read_imagej_display_ranges(reference_path)
+            if stored_ranges is not None and len(stored_ranges) >= 2:
+                reference_limits = (
+                    float(stored_ranges[0]),
+                    float(stored_ranges[1]),
+                )
+            else:
+                reference_limits = reference_source.sample_contrast(
+                    0, self.percentiles
+                )
+            scale = (
+                full_shape[0] / preview.shape[0],
+                full_shape[1] / preview.shape[1],
+            )
+            paths, label_points, labels = geometry_display_paths(
+                regions, transform, scale
+            )
+        except Exception as error:
+            self._QMessageBox.critical(
+                self.widget, "ROI display failed", str(error)
+            )
+            return
+        self._roi_regions = regions
+        self._remove_roi_layers()
+        for layer in (
+            self.fixed_image,
+            self.moving_image,
+            self.registered_image,
+            self.fixed_points,
+            self.moving_points,
+            self.fixed_centers,
+            self.moving_centers,
+        ):
+            layer.visible = False
+        self._roi_reference_layer = self.viewer.add_image(
+            preview,
+            name=f"ROI REFERENCE — {result['resolution']}",
+            colormap="gray",
+            contrast_limits=reference_limits,
+        )
+        self._roi_shapes_layer = self.viewer.add_shapes(
+            paths,
+            shape_type="path",
+            name="ROI outlines",
+            edge_color="yellow",
+            edge_width=1,
+        )
+        self._roi_shapes_layer.editable = False
+        self._roi_labels_layer = self.viewer.add_points(
+            np.asarray(label_points),
+            name="ROI labels",
+            size=2,
+            opacity=1,
+            face_color=[0.0, 0.0, 0.0, 0.0],
+            border_color=[0.0, 0.0, 0.0, 0.0],
+            features={"label": labels},
+            text={
+                "string": "{label}",
+                "size": 9,
+                "color": "yellow",
+            },
+        )
+        self._roi_labels_layer.editable = False
+        self.viewer.layers.selection.active = self._roi_reference_layer
+        self._roi_viewing = True
+        self.viewer.reset_view()
+        self.status.setText(
+            f"Displayed {len(regions)} ROI polygon(s) on {result['resolution']}."
+        )
+
+    def _set_roi_analysis_enabled(self, enabled: bool) -> None:
+        self.roi_load_button.setEnabled(enabled)
+        self.roi_display_button.setEnabled(
+            enabled and self._roi_shapefile_path is not None
+        )
+        self.roi_statistics_button.setEnabled(
+            enabled and self._roi_shapefile_path is not None
+        )
+        self.roi_patches_button.setEnabled(
+            enabled and self._roi_shapefile_path is not None
+        )
+
+    def _start_roi_analysis(
+        self, write_statistics: bool, write_patches: bool
+    ) -> None:
+        from napari.qt.threading import create_worker
+        from qtpy.QtCore import QObject, Signal
+
+        from roi_analysis import analyze_exported_rois, load_shapefile_regions
+
+        class ROIProgressRelay(QObject):
+            progressed = Signal(object)
+
+        result = self._selected_roi_export()
+        if result is None or self._roi_shapefile_path is None:
+            return
+        reference_key = str(Path(result["reference_path"]).resolve())
+        reference_outputs = result["outputs"].get(reference_key, [])
+        if not reference_outputs:
+            return
+        try:
+            import rasterio
+
+            with rasterio.open(reference_outputs[0]) as reference:
+                regions = load_shapefile_regions(
+                    self._roi_shapefile_path,
+                    reference.crs,
+                    self.roi_id_field.currentText(),
+                    self.roi_name_field.currentText(),
+                )
+        except Exception as error:
+            self._QMessageBox.critical(
+                self.widget, "ROI analysis failed", str(error)
+            )
+            return
+        progress_relay = ROIProgressRelay(self.widget)
+        progress_relay.progressed.connect(self._roi_analysis_progress)
+        self._roi_progress_relay = progress_relay
+        worker = create_worker(
+            analyze_exported_rois,
+            result,
+            regions,
+            self._roi_shapefile_path,
+            self.roi_margin.value(),
+            write_statistics,
+            write_patches,
+            progress_relay.progressed.emit,
+        )
+        worker.returned.connect(self._roi_analysis_finished)
+        worker.errored.connect(self._roi_analysis_failed)
+        worker.finished.connect(lambda: self._active_workers.discard(worker))
+        self._active_workers.add(worker)
+        self._roi_started_at = monotonic()
+        self._set_roi_analysis_enabled(False)
+        operation = "statistics" if write_statistics else "patches and masks"
+        self.status.setText(f"ROI analysis starting: {operation}…")
+        self._show_canvas_message(
+            f"ROI ANALYSIS — {operation.upper()}…\nPreparing regions and files",
+            "#66bbff",
+        )
+        worker.start()
+
+    def _roi_analysis_progress(self, progress: dict[str, Any]) -> None:
+        """Render thread-safe ROI progress in the panel and on the canvas."""
+        phase = str(progress.get("phase", "preparing"))
+        completed = int(progress.get("completed", 0))
+        total = max(1, int(progress.get("total", 1)))
+        percent = min(100, round(100 * completed / total))
+        elapsed = (
+            0.0
+            if self._roi_started_at is None
+            else monotonic() - self._roi_started_at
+        )
+        region_index = int(progress.get("region_index", 0))
+        region_count = int(progress.get("region_count", 0))
+        region_id = str(progress.get("region_id", ""))
+        source_image = str(progress.get("source_image", ""))
+        if phase == "preparing":
+            detail = "Preparing regions and output files"
+        elif phase == "mask":
+            detail = f"Mask complete — region {region_id}"
+        elif phase == "rgb":
+            detail = f"Pseudo-RGB complete — {source_image}"
+        elif phase == "tsv":
+            detail = "Writing roi_statistics.tsv"
+        elif phase == "complete":
+            detail = "Finalizing ROI analysis"
+        else:
+            band_number = int(progress.get("band_number", 0))
+            band_count = int(progress.get("band_count", 0))
+            detail = (
+                f"{source_image} — band {band_number}/{band_count} complete"
+            )
+        region_text = (
+            f"region {region_index}/{region_count} ({region_id})"
+            if region_index and region_count
+            else f"{region_count} region(s)"
+        )
+        counts = f"{completed}/{total} steps · {percent}% · {region_text}"
+        timing = f"elapsed {self._format_duration(elapsed)}"
+        self.status.setText(
+            f"ROI analysis: {counts} — {detail} — {timing}"
+        )
+        self._show_canvas_message(
+            f"ROI ANALYSIS — {percent}%\n{counts}\n{detail}\n{timing}",
+            "#66bbff",
+        )
+
+    def _roi_analysis_finished(self, result: Any) -> None:
+        elapsed = (
+            0.0
+            if self._roi_started_at is None
+            else monotonic() - self._roi_started_at
+        )
+        self._roi_started_at = None
+        self._roi_progress_relay = None
+        self._set_roi_analysis_enabled(True)
+        if self.canvas_message.text().startswith("ROI ANALYSIS"):
+            self.canvas_message.hide()
+        self.status.setText(
+            f"ROI analysis complete: {result.region_count} region(s), "
+            f"{result.patch_count} band patch(es), {result.mask_count} mask(s), "
+            f"{result.rgb_count} pseudo-RGB file(s) after "
+            f"{self._format_duration(elapsed)} in {result.output_directory}."
+        )
+
+    def _roi_analysis_failed(self, error: Exception) -> None:
+        self._roi_started_at = None
+        self._roi_progress_relay = None
+        self._set_roi_analysis_enabled(True)
+        if self.canvas_message.text().startswith("ROI ANALYSIS"):
+            self.canvas_message.hide()
+        self.status.setText(f"ROI analysis failed: {error}")
+        self._QMessageBox.critical(
+            self.widget, "ROI analysis failed", str(error)
+        )
+
+    def _restore_existing_export(
+        self, output_directory: Optional[Path] = None
+    ) -> bool:
+        """Enable sample creation when a complete prior export is available."""
+        candidates: list[Path] = []
+        if output_directory is not None:
+            candidates.append(output_directory)
+        pointer_paths = [
+            self._export_pointer_path(),
+            self.moving_source.path.parent / EXPORT_POINTER_FILENAME,
+        ]
+        for pointer_path in pointer_paths:
+            if not pointer_path.is_file():
+                continue
+            try:
+                pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+                candidates.append(Path(pointer["output_directory"]))
+            except (OSError, KeyError, TypeError, json.JSONDecodeError):
+                pass
+        if self.series_widget.state_path is not None:
+            candidates.append(self.series_widget.state_path.parent.parent)
+        candidates.append(self._automatic_output_directory())
+        # Backward compatibility with exports created before the deterministic
+        # sibling <input>_REGISTERED layout.
+        candidates.append(self.moving_source.path.parent / "OUTPUT")
+
+        expected_paths = {str(self.fixed_source.path), str(self.moving_source.path)}
+        if self.series_widget.images:
+            expected_paths = {str(image.path.resolve()) for image in self.series_widget.images}
+        stale_export_found = False
+        for candidate in candidates:
+            result = _load_export_manifest(candidate)
+            if result is None:
+                continue
+            exported_paths = {str(Path(path).resolve()) for path in result["outputs"]}
+            if not expected_paths.issubset(exported_paths):
+                continue
+            if not self._export_matches_current_registration(result):
+                stale_export_found = True
+                continue
+            self._export_result = result
+            self.sample_button.setEnabled(True)
+            self._refresh_roi_exports(Path(result["output_directory"]))
+            self.status.setText(
+                "Existing completed export detected; 512×512 sample creation is available."
+            )
+            return True
+        if stale_export_found:
+            self._export_result = None
+            self.sample_button.setEnabled(False)
+            self.status.setText(
+                "Existing export is obsolete because registration points changed; "
+                "run a new full-resolution export."
+            )
+        return False
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0, round(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}h {minutes:02d}m"
+        if minutes:
+            return f"{minutes:d}m {seconds:02d}s"
+        return f"{seconds:d}s"
+
+    def _export_progress(self, progress: dict[str, Any]) -> None:
+        """Render thread-safe export progress forwarded onto the GUI thread."""
+        if progress.get("phase") == "assemble":
+            factor = int(progress.get("subsample_factor", 1))
+            detail = (
+                f"{progress['image']} — {progress['completed']}/{progress['total']}"
+            )
+            self.status.setText(f"Assembling all-bands GeoTIFF: {detail}")
+            self._show_canvas_message(
+                f"ASSEMBLING ×{factor} MULTIBAND GEOTIFFS…\n{detail}",
+                "#66bbff",
+            )
+            return
+        completed = int(progress["completed"])
+        total = max(1, int(progress["total"]))
+        elapsed = (
+            0.0
+            if self._export_started_at is None
+            else monotonic() - self._export_started_at
+        )
+        active = int(progress.get("active", 0))
+        warped_completed = int(progress.get("warped_completed", 0))
+        warped_total = int(progress.get("warped_total", 0))
+        copied_completed = int(progress.get("copied_completed", 0))
+        copied_total = int(progress.get("copied_total", 0))
+        action = "completed" if progress.get("event") == "completed" else "working"
+        detail = (
+            f"{progress['image']} — band {progress['band']}/{progress['band_count']} "
+            f"({action})"
+        )
+        counts = (
+            f"{completed}/{total} bands complete · {active} active · "
+            f"warped {warped_completed}/{warped_total} · "
+            f"reference copies {copied_completed}/{copied_total}"
+        )
+        eta = progress.get("eta_seconds")
+        eta_text = (
+            f"ETA {self._format_duration(float(eta))}"
+            if eta is not None
+            else "ETA calculating after first warped band…"
+        )
+        timing = f"elapsed {self._format_duration(elapsed)} · {eta_text}"
+        factor = int(progress.get("subsample_factor", 1))
+        self.status.setText(
+            f"Raster export ×{factor}: {counts} — {detail} — {timing}"
+        )
+        self._show_canvas_message(
+            f"RASTER EXPORT ×{factor}\n{counts}\n{detail}\n{timing}",
+            "#66bbff",
+        )
 
     def _choose_series_reference(self) -> Optional[Path]:
         """Ask which series image defines the output geometry."""
@@ -2082,15 +4067,67 @@ class RegistrationController:
 
     def _export_finished(self, result: dict[str, Any]) -> None:
         self._export_result = result
+        self._remember_export(result)
+        self._refresh_roi_exports(Path(result["output_directory"]))
+        elapsed = (
+            0.0
+            if self._export_started_at is None
+            else monotonic() - self._export_started_at
+        )
+        self._export_started_at = None
+        self._export_progress_relay = None
+        self._export_cancel_event = None
+        self.export_button.setEnabled(True)
+        self.export_workers.setEnabled(True)
+        self.export_resolution.setEnabled(True)
+        self.crop_export_to_data.setEnabled(True)
+        self.cancel_export_button.setEnabled(False)
         self.sample_button.setEnabled(True)
+        if self.canvas_message.text().startswith(
+            ("RASTER EXPORT", "ASSEMBLING")
+        ):
+            self.canvas_message.hide()
         output_count = sum(len(paths) for paths in result["outputs"].values())
         warning = ""
         if result.get("unreachable"):
             warning = f" {len(result['unreachable'])} image(s) were unreachable."
         self.status.setText(
             f"Export complete: {output_count} band file(s) in "
-            f"{Path(result['output_directory']) / 'BANDS'}.{warning}"
+            f"{Path(result['output_directory']) / REGISTERED_IMAGES_DIRECTORY} "
+            f"after {self._format_duration(elapsed)}.{warning}"
         )
+
+    def _export_failed(self, error: Exception) -> None:
+        cancelled = isinstance(error, ExportCancelled) or (
+            self._export_cancel_event is not None
+            and self._export_cancel_event.is_set()
+        )
+        self._export_started_at = None
+        self._export_progress_relay = None
+        self._export_cancel_event = None
+        self.export_button.setEnabled(True)
+        self.export_workers.setEnabled(True)
+        self.export_resolution.setEnabled(True)
+        self.crop_export_to_data.setEnabled(True)
+        self.cancel_export_button.setEnabled(False)
+        if self.canvas_message.text().startswith(
+            ("RASTER EXPORT", "ASSEMBLING", "STOPPING EXPORT")
+        ):
+            self.canvas_message.hide()
+        if cancelled:
+            if self._restore_existing_export():
+                self.status.setText(
+                    "Export stopped. The previous completed export is still valid "
+                    "for the current control points."
+                )
+            else:
+                self.status.setText(
+                    "Export stopped. No completed export matches the current "
+                    "control points; restart export after choosing the worker count."
+                )
+            return
+        self.status.setText(f"Raster export failed: {error}")
+        self._QMessageBox.critical(self.widget, "Export failed", str(error))
 
     def _begin_sample_selection(self, *_: Any) -> None:
         if self._export_result is None:
@@ -2166,7 +4203,9 @@ class RegistrationController:
             for paths in result["outputs"].values()
             if paths
         ]
-        output_path = Path(result["output_directory"]) / "SAMPLE_RESULT.tif"
+        output_path = (
+            Path(result["output_directory"]) / "PATCHES" / "SAMPLE_RESULT.tif"
+        )
         self._sample_selecting = False
         self.canvas_message.hide()
         self.sample_button.setEnabled(False)
@@ -2228,7 +4267,7 @@ def parse_args() -> argparse.Namespace:
         dest="series_dir",
         help="Directory containing a series named <scene>_<MS|IR>.tif",
     )
-    parser.add_argument("--preview-factor", type=int, default=4)
+    parser.add_argument("--preview-factor", type=int, default=8)
     parser.add_argument("--low-percentile", type=float, default=0.5)
     parser.add_argument("--high-percentile", type=float, default=99.5)
     return parser.parse_args()

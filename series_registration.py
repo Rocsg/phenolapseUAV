@@ -39,11 +39,27 @@ KNOWN_MODALITIES = ("MS", "IR")
 STATE_FILENAME = "manual_registration_state.json"
 
 
-def automatic_state_path(directory: Path) -> Path:
-    """Return OUTPUT/<relative input path>/STATE_FILENAME for a series directory."""
+def registered_output_directory(directory: Path) -> Path:
+    """Return the deterministic output root beside an input image directory."""
     directory = directory.resolve()
+    return directory.parent / f"{directory.name}_REGISTERED"
+
+
+def automatic_state_path(directory: Path) -> Path:
+    """Return <input>_REGISTERED/STATE/STATE_FILENAME."""
+    return registered_output_directory(directory) / "STATE" / STATE_FILENAME
+
+
+def _legacy_state_paths(directory: Path) -> list[Path]:
+    """Return state locations used before the deterministic REGISTERED layout."""
+    directory = directory.resolve()
+    paths = [directory.parent / "OUTPUT" / directory.name / STATE_FILENAME]
     input_root = next(
-        (parent for parent in (directory, *directory.parents) if parent.name.lower() == "input"),
+        (
+            parent
+            for parent in (directory, *directory.parents)
+            if parent.name.lower() == "input"
+        ),
         None,
     )
     if input_root is not None:
@@ -53,9 +69,13 @@ def automatic_state_path(directory: Path) -> Path:
             if child.is_dir()
         }
         output_root = siblings.get("output", input_root.parent / "OUTPUT")
-        relative = directory.relative_to(input_root)
-        return output_root / relative / STATE_FILENAME
-    return directory.parent / "OUTPUT" / directory.name / STATE_FILENAME
+        try:
+            paths.insert(
+                0, output_root / directory.relative_to(input_root) / STATE_FILENAME
+            )
+        except ValueError:
+            pass
+    return paths
 
 
 @dataclass(frozen=True)
@@ -116,14 +136,53 @@ def discover_series(directory: Path) -> tuple[list[SeriesImage], list[str]]:
     return images, warnings
 
 
+def best_moving_path(
+    images: list[SeriesImage], fixed_path: Path
+) -> Optional[Path]:
+    """Choose the preferred MOVING image for a FIXED graph node."""
+    fixed_path = fixed_path.resolve()
+    fixed = next(
+        (image for image in images if image.path.resolve() == fixed_path), None
+    )
+    if fixed is None:
+        return None
+
+    same_modality = sorted(
+        (image for image in images if image.modality == fixed.modality),
+        key=lambda image: (image.path.name.casefold(), image.path.name),
+    )
+    for index, image in enumerate(same_modality[:-1]):
+        if image.path.resolve() == fixed_path:
+            return same_modality[index + 1].path
+
+    try:
+        modality_index = KNOWN_MODALITIES.index(fixed.modality)
+    except ValueError:
+        return None
+    for modality in KNOWN_MODALITIES[modality_index + 1 :]:
+        candidate = next(
+            (
+                image
+                for image in images
+                if image.scene == fixed.scene and image.modality == modality
+            ),
+            None,
+        )
+        if candidate is not None:
+            return candidate.path
+    return None
+
+
 class ImageNode(QGraphicsRectItem):
     """Selectable graphics item carrying one image path."""
 
-    def __init__(self, image: SeriesImage, x: float, y: float) -> None:
+    def __init__(
+        self, image: SeriesImage, x: float, y: float, role_clicked: Any
+    ) -> None:
         super().__init__(0, 0, 132, 30)
         self.setPos(x, y)
         self.image = image
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self._role_clicked = role_clicked
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemClipsChildrenToShape, True)
         self.setBrush(QBrush(QColor("#30343b")))
         self.setPen(QPen(QColor("#666b73"), 1.5))
@@ -131,9 +190,24 @@ class ImageNode(QGraphicsRectItem):
         label.setBrush(QBrush(QColor("#f0f0f0")))
         label.setFont(QFont("Sans Serif", 7))
         label.setPos(5, 7)
-        label.setToolTip(str(image.path))
+        label.setToolTip(
+            f"{image.path}\nLeft click: FIXED\nRight click: MOVING"
+        )
         label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self.setToolTip(str(image.path))
+        self.setToolTip(
+            f"{image.path}\nLeft click: FIXED\nRight click: MOVING"
+        )
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            role = "fixed"
+        elif event.button() == Qt.MouseButton.RightButton:
+            role = "moving"
+        else:
+            super().mousePressEvent(event)
+            return
+        event.accept()
+        self._role_clicked(self.image.path, role)
 
     def set_role(self, role: str) -> None:
         if role == "fixed":
@@ -169,12 +243,12 @@ class SeriesRegistrationWidget(QGroupBox):
         layout.addLayout(buttons)
 
         self.status = QLabel(
-            "Open a directory, then click FIXED (red) and MOVING (green)."
+            "Open a directory, then left-click FIXED (red). "
+            "MOVING (green) is selected automatically; right-click to override it."
         )
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.scene = QGraphicsScene(self)
-        self.scene.selectionChanged.connect(self._selection_changed)
         self.view = QGraphicsView(self.scene)
         self.view.setMinimumHeight(210)
         self.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -203,9 +277,15 @@ class SeriesRegistrationWidget(QGroupBox):
         self.first_selection = None
         restored = 0
         state_warning = ""
-        if self.state_path.exists():
+        state_source = self.state_path
+        if not state_source.exists():
+            state_source = next(
+                (path for path in _legacy_state_paths(self.directory) if path.exists()),
+                state_source,
+            )
+        if state_source.exists():
             try:
-                payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+                payload = json.loads(state_source.read_text(encoding="utf-8"))
                 if payload.get("format") != "napari-tps-register-series":
                     raise ValueError("unrecognized file format")
                 available = {image.path for image in images}
@@ -225,11 +305,13 @@ class SeriesRegistrationWidget(QGroupBox):
         warning_text = f" — {len(warnings)} warning(s)" if warnings else ""
         self.status.setText(
             f"{len(images)} image(s), {restored} pair(s) restored"
-            f"{warning_text}{state_warning}. Click FIXED, then MOVING."
+            f"{warning_text}{state_warning}. Left-click FIXED; "
+            "right-click to override MOVING."
         )
         tooltip_lines = [f"Automatic state file: {self.state_path}"]
         tooltip_lines.extend(warnings)
         self.status.setToolTip("\n".join(tooltip_lines))
+        self.controller._restore_existing_export(self.state_path.parent.parent)
 
     def _rebuild_scene(self) -> None:
         self.scene.blockSignals(True)
@@ -283,6 +365,7 @@ class SeriesRegistrationWidget(QGroupBox):
                 image,
                 x_for_modality[image.modality],
                 y_for_scene[image.scene],
+                self._graph_node_clicked,
             )
             self.scene.addItem(node)
             self.nodes[image.path] = node
@@ -304,34 +387,37 @@ class SeriesRegistrationWidget(QGroupBox):
         line = self.scene.addLine(x1, y1, x2, y2, QPen(QColor("#25282d"), 3))
         line.setZValue(-10)
 
-    def _selection_changed(self) -> None:
-        selected = [item for item in self.scene.selectedItems() if isinstance(item, ImageNode)]
-        if not selected:
-            return
-        node = selected[-1]
-        self.scene.blockSignals(True)
-        for item in self.nodes.values():
-            item.setSelected(False)
-        node.setSelected(True)
-        self.scene.blockSignals(False)
-        self._choose_image(node.image.path)
-
-    def _choose_image(self, path: Path) -> None:
-        if self.first_selection is None:
+    def _graph_node_clicked(self, path: Path, role: str) -> None:
+        if role == "fixed":
             self.first_selection = path
-            self._refresh_node_roles()
-            self.status.setText(
-                f"FIXED: {path.name}. Now click the MOVING image."
-            )
+            moving_path = best_moving_path(self.images, path)
+            if moving_path is None:
+                self._refresh_node_roles()
+                self.status.setText(
+                    f"FIXED: {path.name}. No automatic match; "
+                    "right-click the MOVING image."
+                )
+                return
+            self._activate_edge(path, moving_path)
             return
-        if path == self.first_selection:
-            self.first_selection = None
-            self._refresh_node_roles()
-            self.status.setText("FIXED selection canceled.")
+        if role != "moving":
             return
+        fixed_path = (
+            self.first_selection
+            or (self.current_edge.fixed_path if self.current_edge else None)
+        )
+        if fixed_path is None:
+            self.status.setText("Left-click the FIXED image first.")
+            return
+        if path == fixed_path:
+            self.status.setText("FIXED and MOVING must be different images.")
+            return
+        self._activate_edge(fixed_path, path)
+
+    def _activate_edge(self, fixed_path: Path, moving_path: Path) -> None:
         self._store_current_session()
         self._write_state_file()
-        edge = RegistrationEdge(self.first_selection, path)
+        edge = RegistrationEdge(fixed_path, moving_path)
         self.edges[edge.key] = edge
         self.current_edge = edge
         self.first_selection = None
@@ -369,12 +455,14 @@ class SeriesRegistrationWidget(QGroupBox):
     def _refresh_node_roles(self) -> None:
         for path, node in self.nodes.items():
             role = ""
-            if self.current_edge and path == self.current_edge.fixed_path:
-                role = "fixed"
-            if self.current_edge and path == self.current_edge.moving_path:
-                role = "moving"
-            if self.first_selection == path:
-                role = "fixed"
+            if self.first_selection is not None:
+                if path == self.first_selection:
+                    role = "fixed"
+            elif self.current_edge:
+                if path == self.current_edge.fixed_path:
+                    role = "fixed"
+                elif path == self.current_edge.moving_path:
+                    role = "moving"
             node.set_role(role)
 
     def _ensure_edge_line(self, edge: RegistrationEdge) -> None:

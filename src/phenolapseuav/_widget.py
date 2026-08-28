@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any, Optional
 
+from qtpy.QtCore import QEvent, Qt
 from qtpy.QtWidgets import (
     QFileDialog,
     QGroupBox,
@@ -29,14 +31,29 @@ class PhenolapseUAVWidget(QWidget):
         self.moving_path: Optional[Path] = None
 
         layout = QVBoxLayout(self)
-        intro = QLabel(
-            "Register one FIXED/MOVING pair or open a complete MS/IR UAV series."
-        )
+        self.launch_widget = QWidget()
+        launch_layout = QVBoxLayout(self.launch_widget)
+        launch_layout.setContentsMargins(0, 0, 0, 0)
+        intro = QLabel("Choose an alignment workflow")
+        intro.setStyleSheet("font-size: 16px; font-weight: bold; padding: 4px;")
         intro.setWordWrap(True)
-        layout.addWidget(intro)
+        launch_layout.addWidget(intro)
 
-        pair_box = QGroupBox("Open one image pair")
-        pair_layout = QVBoxLayout(pair_box)
+        self.pair_mode_button = QPushButton(
+            "1. Alignment of two images\nor orthoimages"
+        )
+        self.pair_mode_button.setMinimumHeight(54)
+        self.pair_mode_button.setCheckable(True)
+        launch_layout.addWidget(self.pair_mode_button)
+
+        self.series_mode_button = QPushButton(
+            "2. Alignment of a time-lapse series\nof images or orthoimages"
+        )
+        self.series_mode_button.setMinimumHeight(64)
+        self.series_mode_button.setCheckable(True)
+
+        self.pair_box = QGroupBox("Choose the two images")
+        pair_layout = QVBoxLayout(self.pair_box)
         buttons = QHBoxLayout()
         self.fixed_button = QPushButton("Choose FIXED…")
         self.moving_button = QPushButton("Choose MOVING…")
@@ -49,25 +66,138 @@ class PhenolapseUAVWidget(QWidget):
         self.open_pair_button = QPushButton("Open selected pair")
         self.open_pair_button.setEnabled(False)
         pair_layout.addWidget(self.open_pair_button)
-        layout.addWidget(pair_box)
+        self.pair_box.setVisible(False)
+        launch_layout.addWidget(self.pair_box)
 
-        options = QHBoxLayout()
-        options.addWidget(QLabel("Preview factor"))
+        launch_layout.addWidget(self.series_mode_button)
+
+        self.series_box = QGroupBox("Raw time-lapse series")
+        self.series_box.setMinimumHeight(125)
+        series_layout = QVBoxLayout(self.series_box)
+        series_help = QLabel(
+            "Choose the directory containing the raw images or orthoimages."
+        )
+        series_help.setWordWrap(True)
+        series_help.setMinimumHeight(42)
+        series_help.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        series_layout.addWidget(series_help)
+        self.open_series_button = QPushButton("Choose raw-data directory…")
+        series_layout.addWidget(self.open_series_button)
+        self.series_box.setVisible(False)
+        launch_layout.addWidget(self.series_box)
+
+        self.preview_options = QWidget()
+        options = QHBoxLayout(self.preview_options)
+        options.setContentsMargins(0, 8, 0, 0)
+        options.addWidget(QLabel("Preview factor (live)"))
         self.preview_factor = QSpinBox()
         self.preview_factor.setRange(1, 64)
-        self.preview_factor.setValue(4)
+        self.preview_factor.setValue(8)
+        self.preview_factor.setToolTip(
+            "Reload the in-memory previews at this subsampling factor. "
+            "Landmarks remain stored at full resolution."
+        )
         options.addWidget(self.preview_factor)
         options.addStretch(1)
-        layout.addLayout(options)
+        self.preview_options.setVisible(False)
+        launch_layout.addWidget(self.preview_options)
+        launch_layout.addStretch(1)
+        layout.addWidget(self.launch_widget)
 
-        self.open_series_button = QPushButton("Open MS/IR series directory…")
-        layout.addWidget(self.open_series_button)
-        layout.addStretch(1)
-
+        self.pair_mode_button.clicked.connect(self._show_pair_workflow)
+        self.series_mode_button.clicked.connect(self._show_series_workflow)
         self.fixed_button.clicked.connect(self._choose_fixed)
         self.moving_button.clicked.connect(self._choose_moving)
         self.open_pair_button.clicked.connect(self._open_pair)
         self.open_series_button.clicked.connect(self._open_series)
+        self.preview_factor.valueChanged.connect(self._change_preview_factor)
+
+        self._welcome_canvas = self._canvas_widget()
+        self.welcome_message: Optional[QLabel] = None
+        if self._welcome_canvas is not None:
+            self.welcome_message = QLabel(self._welcome_canvas)
+            self.welcome_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.welcome_message.setWordWrap(True)
+            self.welcome_message.setText(
+                "Welcome to PhenoLapseUAV\n\n"
+                "Choose one of the two alignment options (right panel)."
+            )
+            self.welcome_message.setStyleSheet(
+                "background: rgba(20, 20, 20, 220); color: white; "
+                "font-size: 24px; font-weight: bold; "
+                "border: 3px solid #66bbff; border-radius: 12px; padding: 24px;"
+            )
+            self.welcome_message.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+            )
+            self._welcome_canvas.installEventFilter(self)
+            self._position_welcome_message()
+            self.welcome_message.show()
+
+    def _canvas_widget(self) -> Optional[QWidget]:
+        qt_viewer = getattr(self.viewer.window, "qt_viewer", None)
+        if qt_viewer is None:
+            qt_viewer = getattr(self.viewer.window, "_qt_viewer", None)
+        canvas = getattr(qt_viewer, "canvas", None)
+        native = getattr(canvas, "native", None)
+        return native if isinstance(native, QWidget) else None
+
+    def _position_welcome_message(self) -> None:
+        if self.welcome_message is None or self._welcome_canvas is None:
+            return
+        width = min(700, max(360, self._welcome_canvas.width() - 80))
+        self.welcome_message.setFixedWidth(width)
+        self.welcome_message.adjustSize()
+        self.welcome_message.move(
+            max(0, (self._welcome_canvas.width() - self.welcome_message.width()) // 2),
+            max(0, (self._welcome_canvas.height() - self.welcome_message.height()) // 2),
+        )
+        self.welcome_message.raise_()
+
+    def eventFilter(self, watched: Any, event: Any) -> bool:
+        if watched is self._welcome_canvas and event.type() == QEvent.Type.Resize:
+            self._position_welcome_message()
+        return super().eventFilter(watched, event)
+
+    def _select_workflow(self, workflow: str) -> None:
+        pair_mode = workflow == "pair"
+        self.pair_mode_button.setChecked(pair_mode)
+        self.series_mode_button.setChecked(not pair_mode)
+        self.pair_box.setVisible(pair_mode)
+        self.series_box.setVisible(not pair_mode)
+        self.preview_options.setVisible(True)
+        if self.welcome_message is not None:
+            self.welcome_message.hide()
+
+    def _show_pair_workflow(self, *_: Any) -> None:
+        self._select_workflow("pair")
+
+    def _show_series_workflow(self, *_: Any) -> None:
+        self._select_workflow("series")
+
+    def closeEvent(self, event: Any) -> None:
+        if self._welcome_canvas is not None:
+            self._welcome_canvas.removeEventFilter(self)
+        if self.welcome_message is not None:
+            self.welcome_message.deleteLater()
+            self.welcome_message = None
+        super().closeEvent(event)
+
+    def _change_preview_factor(self, factor: int) -> None:
+        if self.controller is None:
+            return
+        previous = self.controller.preview_factor
+        try:
+            self.controller.set_preview_factor(factor)
+        except Exception as error:
+            self.preview_factor.blockSignals(True)
+            try:
+                self.preview_factor.setValue(previous)
+            finally:
+                self.preview_factor.blockSignals(False)
+            QMessageBox.critical(self, "Unable to reload previews", str(error))
 
     def _choose_raster(self, title: str) -> Optional[Path]:
         filename, _ = QFileDialog.getOpenFileName(
@@ -95,6 +225,20 @@ class PhenolapseUAVWidget(QWidget):
             self.fixed_path is not None and self.moving_path is not None
         )
 
+    @staticmethod
+    def _pair_state_path(fixed_path: Path, moving_path: Path) -> Path:
+        from series_registration import registered_output_directory
+
+        identity = f"{fixed_path.resolve()}::{moving_path.resolve()}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+        fixed_name = fixed_path.stem[:60]
+        moving_name = moving_path.stem[:60]
+        return (
+            registered_output_directory(moving_path.parent)
+            / "STATE"
+            / f"{fixed_name}__TO__{moving_name}_{digest}.json"
+        )
+
     def _install_controller(self, fixed_path: Path, moving_path: Path) -> Any:
         from napari_tps_register import RasterioSource, RegistrationController
 
@@ -108,18 +252,17 @@ class PhenolapseUAVWidget(QWidget):
             self.preview_factor.value(),
         )
         self.layout().insertWidget(0, self.controller.widget)
-        for widget in (
-            self.fixed_button.parentWidget(),
-            self.open_series_button,
-        ):
-            widget.setVisible(False)
+        self.launch_widget.setVisible(False)
         return self.controller
 
     def _open_pair(self) -> None:
         if self.fixed_path is None or self.moving_path is None:
             return
         try:
-            self._install_controller(self.fixed_path, self.moving_path)
+            state_path = self._pair_state_path(self.fixed_path, self.moving_path)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            controller = self._install_controller(self.fixed_path, self.moving_path)
+            controller.configure_standalone_state(state_path)
         except Exception as error:
             QMessageBox.critical(self, "Unable to open images", str(error))
 

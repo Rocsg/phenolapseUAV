@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phenolapseuav"
-version = "0.1.0"
+version = "1.0.0"
 description = "Interactive landmark-based registration of multispectral and infrared UAV orthomosaics in napari"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [
@@ -23,19 +23,21 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 dependencies = [
     "affine>=2.4",
+    "fiona>=1.9",
     "napari>=0.5.6",
     "numpy>=1.26",
     "pyproj>=3.5",
     "qtpy>=2.4",
     "rasterio>=1.3",
     "scikit-image>=0.26",
+    "shapely>=2.0",
+    "tifffile>=2024.8.30",
 ]
 
 [project.optional-dependencies]
@@ -58,7 +60,7 @@ phenolapseuav = "phenolapseuav:napari.yaml"
 
 [tool.setuptools]
 packages = ["phenolapseuav"]
-py-modules = ["napari_tps_register", "register_orthomosaics", "register_series", "series_registration"]
+py-modules = ["napari_tps_register", "register_orthomosaics", "register_series", "roi_analysis", "series_registration"]
 include-package-data = true
 
 [tool.setuptools.package-dir]
@@ -76,7 +78,7 @@ source = ["phenolapseuav", "napari_tps_register", "series_registration"]
 branch = true
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]

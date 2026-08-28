@@ -1,3 +1,4 @@
 include README.md LICENSE CITATION.cff CHANGELOG.md CONTRIBUTING.md CODE_OF_CONDUCT.md .zenodo.json
+include test_*.py
 include src/phenolapseuav/napari.yaml
 recursive-include paper *.md *.bib
