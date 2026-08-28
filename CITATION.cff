@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use phenolapseUAV in your research, please cite this software."
+title: "phenolapseUAV: interactive registration of multispectral UAV time series"
+type: software
+version: 0.1.0
+date-released: 2026-08-28
+license: GPL-3.0-only
+repository-code: "https://github.com/Rocsg/phenolapseUAV"
+url: "https://github.com/Rocsg/phenolapseUAV"
+authors:
+  - family-names: Fernandez
+    given-names: Romain
+  - family-names: Diene
+    given-names: Serigne Mansour
+  - family-names: Audebert
+    given-names: Alain
+keywords:
+  - image registration
+  - UAV
+  - multispectral imaging
+  - infrared imaging
+  - phenotyping
+  - napari

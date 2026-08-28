@@ -1,0 +1,11 @@
+name: phenolapseUAV
+display_name: phenolapseUAV
+schema_version: 0.2.1
+contributions:
+  commands:
+    - id: phenolapseUAV.make_registration_widget
+      python_name: phenolapseuav._widget:PhenolapseUAVWidget
+      title: Open phenolapseUAV registration
+  widgets:
+    - command: phenolapseUAV.make_registration_widget
+      display_name: phenolapseUAV Registration

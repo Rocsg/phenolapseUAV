@@ -1,0 +1,2 @@
+# Install the package, automatic-registration extras, and release tooling.
+-e .[automatic,dev]

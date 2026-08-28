@@ -1,0 +1,27 @@
+{
+  "title": "phenolapseUAV: interactive registration of multispectral UAV time series",
+  "description": "An open-source napari plugin for interactive and automatic registration of georeferenced multispectral and infrared UAV orthomosaics.",
+  "license": "GPL-3.0-only",
+  "upload_type": "software",
+  "access_right": "open",
+  "creators": [
+    {"name": "Fernandez, Romain"},
+    {"name": "Diene, Serigne Mansour"},
+    {"name": "Audebert, Alain"}
+  ],
+  "keywords": [
+    "napari",
+    "image registration",
+    "UAV",
+    "multispectral imaging",
+    "infrared imaging",
+    "phenotyping"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/Rocsg/phenolapseUAV",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}
