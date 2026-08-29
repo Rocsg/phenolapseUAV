@@ -1479,7 +1479,7 @@ def _write_registered_band_files(
 
 def _save_export_manifest(result: dict[str, Any]) -> Path:
     """Persist a completed export atomically for discovery in later sessions."""
-    output_directory = Path(result["output_directory"]).resolve()
+    output_directory = Path(result["output_directory"])
     state_directory = output_directory / "STATE"
     state_directory.mkdir(parents=True, exist_ok=True)
     manifest_path = state_directory / EXPORT_MANIFEST_FILENAME
@@ -1528,7 +1528,7 @@ def _load_export_manifest_path(manifest_path: Path) -> Optional[dict[str, Any]]:
 
 def _load_export_manifest(output_directory: Path) -> Optional[dict[str, Any]]:
     """Return the most recent completed export for backward compatibility."""
-    output_directory = output_directory.resolve()
+    output_directory = Path(output_directory)
     manifest_path = output_directory / "STATE" / EXPORT_MANIFEST_FILENAME
     if not manifest_path.is_file():
         manifest_path = output_directory / EXPORT_MANIFEST_FILENAME
@@ -1540,7 +1540,7 @@ def _load_resolution_export_manifests(
     registration_signature: Optional[str] = None,
 ) -> dict[str, dict[str, Any]]:
     """Return all complete resolution exports, optionally filtering stale ones."""
-    output_directory = output_directory.resolve()
+    output_directory = Path(output_directory)
     results: dict[str, dict[str, Any]] = {}
     exports_directory = output_directory / "STATE" / "EXPORTS"
     for manifest_path in sorted(exports_directory.glob("*.json")):
@@ -1625,7 +1625,7 @@ def export_registration_series(
 ) -> dict[str, Any]:
     """Export every image reachable from the reference through directed edges."""
     reference_path = reference_path.resolve()
-    output_directory = output_directory.resolve()
+    output_directory = Path(output_directory)
     resolution_name = _resolution_directory_name(subsample_factor)
     bands_directory = (
         output_directory
@@ -1763,7 +1763,7 @@ def export_registration_pair_bands(
             RasterioSource(fixed_path), RasterioSource(moving_path)
         ),
     )
-    output_directory = output_directory.resolve()
+    output_directory = Path(output_directory)
     resolution_name = _resolution_directory_name(subsample_factor)
     bands_directory = (
         output_directory

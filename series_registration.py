@@ -41,7 +41,10 @@ STATE_FILENAME = "manual_registration_state.json"
 
 def registered_output_directory(directory: Path) -> Path:
     """Return the deterministic output root beside an input image directory."""
-    directory = directory.resolve()
+    # Keep the caller's spelling of the path. On Windows, ``resolve()`` can
+    # expand an 8.3 temporary-directory component or turn a lexical POSIX path
+    # into a drive-rooted path, making equivalent output paths compare unequal.
+    directory = Path(directory)
     return directory.parent / f"{directory.name}_REGISTERED"
 
 

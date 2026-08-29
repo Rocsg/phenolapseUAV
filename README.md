@@ -4,6 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/phenolapseUAV.svg)](https://pypi.org/project/phenolapseUAV/)
 [![Python](https://img.shields.io/pypi/pyversions/phenolapseUAV.svg)](https://pypi.org/project/phenolapseUAV/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22150993.svg)](https://doi.org/10.5281/zenodo.22150993)
 
 **phenolapseUAV** is an open-source napari plugin for interactive and automatic
 registration of large georeferenced multispectral and infrared UAV
