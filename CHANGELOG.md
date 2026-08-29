@@ -6,6 +6,18 @@ All notable changes to phenolapseUAV are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-08-29
+
+### Added
+
+-Fix test under windows
+
+## [1.0.1] - 2026-08-29
+
+### Added
+
+-Fix test under windows
+
 ## [1.0.0] - 2026-08-28
 
 ### Added
