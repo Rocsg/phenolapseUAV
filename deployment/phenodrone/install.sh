@@ -51,7 +51,9 @@ cat > "$LAUNCHER_DIRECTORY/phenolapseuav" <<'EOF'
 set -euo pipefail
 # Safer over X11 forwarding; avoids shared-memory errors with remote displays.
 export QT_X11_NO_MITSHM=1
-exec /opt/phenodrone/venv/bin/phenolapseUAV-gui "$@"
+# Start napari from the shared environment. Its plugin manager then discovers
+# PhenoLapseUAV from that same environment's napari manifest.
+exec /opt/phenodrone/venv/bin/napari "$@"
 EOF
 chmod 0755 "$LAUNCHER_DIRECTORY/phenolapseuav"
 

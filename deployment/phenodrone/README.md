@@ -29,7 +29,7 @@ Le script :
 
 ## Utilisation
 
-Chaque utilisateur démarre **PhenoLapseUAV** depuis le menu des applications ou exécute `/opt/phenodrone/bin/phenolapseuav` depuis un terminal graphique. Le lanceur ouvre directement napari avec le panneau PhenoLapseUAV déjà visible.
+Chaque utilisateur démarre **PhenoLapseUAV** depuis le menu des applications ou exécute `/opt/phenodrone/bin/phenolapseuav` depuis un terminal graphique. Le lanceur ouvre napari depuis l'environnement partagé ; napari découvre ensuite le plugin PhenoLapseUAV dans son menu **Plugins**.
 
 Les images, états de recalage et exports restent dans les dossiers de données des utilisateurs. Ne pas donner de droits d'écriture ordinaires sur `/opt/phenodrone`.
 
