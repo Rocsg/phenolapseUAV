@@ -43,6 +43,9 @@ if [[ ! -x "$VENV_DIRECTORY/bin/python" ]]; then
     "$PYTHON_BIN" -m venv "$VENV_DIRECTORY"
 fi
 "$VENV_DIRECTORY/bin/python" -m pip install --upgrade pip
+# napari deliberately has no default Qt binding. PyQt5 is installed explicitly
+# for the shared graphical Linux application and works with X11 forwarding.
+"$VENV_DIRECTORY/bin/python" -m pip install --upgrade "napari[pyqt5]"
 "$VENV_DIRECTORY/bin/python" -m pip install --upgrade "$REPOSITORY_DIRECTORY"
 "$VENV_DIRECTORY/bin/python" -m pip check
 

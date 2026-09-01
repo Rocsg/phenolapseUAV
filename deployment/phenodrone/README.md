@@ -23,7 +23,7 @@ Le script :
 
 1. clone ou actualise le dépôt central dans `/opt/phenodrone/phenolapseUAV` ;
 2. crée `/opt/phenodrone/venv` ;
-3. installe le paquet et ses dépendances dans cet environnement ;
+3. installe napari avec le backend graphique PyQt5, puis le paquet et ses dépendances dans cet environnement ;
 4. crée les commandes communes `/opt/phenodrone/bin/phenolapseuav` et `/opt/phenodrone/bin/phenolapseuav-update` ;
 5. ajoute le lanceur graphique système.
 
