@@ -52,6 +52,7 @@ Documentation = "https://github.com/Rocsg/phenolapseUAV#readme"
 
 [project.scripts]
 phenolapseUAV = "napari_tps_register:main"
+phenolapseUAV-gui = "phenolapseuav.launcher:main"
 phenolapseUAV-register-pair = "register_orthomosaics:main"
 phenolapseUAV-register-series = "register_series:main"
 
