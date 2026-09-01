@@ -715,6 +715,36 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual(int(page.tags["ResolutionUnit"].value), 3)
                 self.assertEqual(tif.imagej_metadata["unit"], "cm")
 
+    def test_unrepresentable_imagej_calibration_does_not_abort_export(self) -> None:
+        import rasterio
+        from affine import Affine
+        from tifffile import TiffFile
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tiny_pixels.tif"
+            data = np.ones((8, 8), dtype=np.uint16)
+            with rasterio.open(
+                path,
+                "w",
+                driver="GTiff",
+                width=8,
+                height=8,
+                count=1,
+                dtype=data.dtype,
+                crs="EPSG:32631",
+                transform=Affine.scale(1e-12, -1e-12),
+            ) as destination:
+                destination.write(data, 1)
+
+            _write_imagej_display_ranges(path, (0.0, 1.0))
+
+            self.assertEqual(_read_imagej_display_ranges(path), (0.0, 1.0))
+            with rasterio.open(path) as exported:
+                np.testing.assert_array_equal(exported.read(1), data)
+                self.assertEqual(exported.transform, Affine.scale(1e-12, -1e-12))
+            with TiffFile(path) as tif:
+                self.assertNotIn("unit", tif.imagej_metadata)
+
     def test_registration_signature_changes_with_control_points(self) -> None:
         first = [LandmarkPair(1, (10.0, 20.0), (11.0, 22.0))]
         moved = [LandmarkPair(1, (10.0, 20.0), (12.0, 22.0))]

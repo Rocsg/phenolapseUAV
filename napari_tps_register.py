@@ -376,18 +376,41 @@ def _imagej_spatial_calibration(
     return 1.0 / pixel_width_cm, 1.0 / pixel_height_cm, "cm", 3
 
 
+def _tiff_rational(value: float) -> Optional[tuple[int, int]]:
+    """Encode a positive finite value in TIFF's unsigned 32-bit RATIONAL."""
+    from fractions import Fraction
+
+    if not np.isfinite(value) or value <= 0:
+        return None
+    fraction = Fraction(value).limit_denominator(0xFFFFFFFF)
+    numerator, denominator = fraction.numerator, fraction.denominator
+    if not (0 < numerator <= 0xFFFFFFFF and 0 < denominator <= 0xFFFFFFFF):
+        return None
+    return numerator, denominator
+
+
 def _write_imagej_display_ranges(
     path: Path, ranges: Sequence[float]
 ) -> None:
     """Add Fiji display and spatial calibration without changing pixels."""
-    from fractions import Fraction
-
     from tifffile import imagej_metadata_tag
 
     values = tuple(float(value) for value in ranges)
     if not values or len(values) % 2:
         raise ValueError("ImageJ display ranges require min/max pairs")
     calibration = _imagej_spatial_calibration(path)
+    rational_calibration: Optional[tuple[tuple[int, int], tuple[int, int]]] = None
+    if calibration is not None:
+        x_rational = _tiff_rational(calibration[0])
+        y_rational = _tiff_rational(calibration[1])
+        if x_rational is not None and y_rational is not None:
+            rational_calibration = (x_rational, y_rational)
+        else:
+            # TIFF RATIONAL values are restricted to unsigned 32-bit
+            # numerators and denominators. Preserve any source resolution
+            # tags rather than failing the complete export for a calibration
+            # that cannot be represented in that format.
+            calibration = None
     with path.open("r+b") as stream:
         header = stream.read(16)
         if header[:2] == b"II":
@@ -498,16 +521,11 @@ def _write_imagej_display_ranges(
                 )
 
         if calibration is not None:
-            x_resolution, y_resolution, _, resolution_unit = calibration
-            for code, resolution in (
-                (282, x_resolution),
-                (283, y_resolution),
+            _, _, _, resolution_unit = calibration
+            assert rational_calibration is not None
+            for code, (numerator, denominator) in zip(
+                (282, 283), rational_calibration
             ):
-                fraction = Fraction(resolution).limit_denominator(1_000_000_000)
-                numerator = fraction.numerator
-                denominator = fraction.denominator
-                if not (0 < numerator <= 0xFFFFFFFF and denominator <= 0xFFFFFFFF):
-                    raise OverflowError("ImageJ pixel resolution exceeds TIFF RATIONAL")
                 rational = struct.pack(
                     f"{byteorder}II", numerator, denominator
                 )
@@ -2105,6 +2123,20 @@ class RegistrationController:
         channel_row.addWidget(self.fixed_combo)
         channel_row.addWidget(self.moving_combo)
         layout.addLayout(channel_row)
+
+        preview_row = QHBoxLayout()
+        preview_row.addWidget(QLabel("Preview factor (live)"))
+        self.preview_factor_spinbox = QSpinBox()
+        self.preview_factor_spinbox.setRange(1, 64)
+        self.preview_factor_spinbox.setValue(preview_factor)
+        self.preview_factor_spinbox.setToolTip(
+            "Reload the in-memory previews at this subsampling factor. "
+            "Landmarks remain stored at full resolution."
+        )
+        self.preview_factor_spinbox.valueChanged.connect(self.set_preview_factor)
+        preview_row.addWidget(self.preview_factor_spinbox)
+        preview_row.addStretch(1)
+        layout.addLayout(preview_row)
 
         marker_row = QHBoxLayout()
         marker_row.addWidget(QLabel("Landmark size"))
