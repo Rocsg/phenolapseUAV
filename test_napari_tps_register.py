@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 import unittest
 from pathlib import Path
@@ -10,9 +11,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import numpy as np
-
 import napari_tps_register as registration_module
+import numpy as np
 
 from napari_tps_register import (
     REGISTERED_IMAGES_DIRECTORY,
@@ -42,6 +42,150 @@ from napari_tps_register import (
     useful_data_bbox,
     yx_to_xy,
 )
+
+
+class PanelNavigationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from qtpy.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_small_panel_scrolls_and_graph_button_reveals_graph(self) -> None:
+        from qtpy.QtCore import Qt
+        from qtpy.QtWidgets import QWidget
+
+        viewer = Mock(
+            mouse_drag_callbacks=[],
+            mouse_move_callbacks=[],
+            camera=Mock(zoom=1.0),
+        )
+        source = Mock()
+        source.info = ImageInfo("image.tif", (1, 64, 64), "uint16", 0)
+        source.read_preview.return_value = np.ones((8, 8))
+        source.read_preview_on_grid.return_value = np.ones((8, 8))
+        source.sample_contrast.return_value = (0.0, 1.0)
+        canvas = QWidget()
+        with (
+            patch.object(RegistrationController, "_canvas_widget", return_value=canvas),
+            patch.object(RegistrationController, "show_overlay"),
+            patch.object(RegistrationController, "_restore_existing_export"),
+        ):
+            controller = RegistrationController(viewer, source, source)
+        try:
+            viewer.camera.events.zoom.connect.assert_called_once_with(
+                controller._update_marker_sizes
+            )
+            controller.widget.resize(480, 450)
+            controller.widget.show()
+            self.app.processEvents()
+            scroll = controller.panel_scroll
+            self.assertEqual(
+                scroll.verticalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+            )
+            self.assertTrue(scroll.verticalScrollBar().isVisible())
+            self.assertGreater(scroll.verticalScrollBar().maximum(), 0)
+            self.assertLessEqual(controller.widget.height(), 450)
+            self.assertIs(scroll.widget(), controller.series_widget.parentWidget())
+            self.assertFalse(
+                controller.series_widget.visibleRegion().intersects(
+                    controller.series_widget.rect()
+                )
+            )
+
+            controller.graph_button.click()
+            self.app.processEvents()
+
+            self.assertGreater(scroll.verticalScrollBar().value(), 0)
+            graph_rect = controller.series_widget.geometry()
+            viewport_rect = scroll.viewport().rect().translated(
+                -scroll.widget().pos()
+            )
+            self.assertGreaterEqual(graph_rect.top(), viewport_rect.top())
+            self.assertLessEqual(graph_rect.bottom(), viewport_rect.bottom())
+            self.assertTrue(controller.graph_button.isVisible())
+        finally:
+            self.app.removeEventFilter(controller._space_key_filter)
+            controller.hover_delete_label.close()
+            controller.widget.close()
+            controller.widget.deleteLater()
+            canvas.deleteLater()
+            self.app.processEvents()
+
+
+class MarkerSizingTests(unittest.TestCase):
+    def _controller(self) -> RegistrationController:
+        from napari.layers import Points
+
+        controller = RegistrationController.__new__(RegistrationController)
+        controller.viewer = SimpleNamespace(camera=SimpleNamespace(zoom=1.0))
+        controller.marker_size = Mock()
+        controller.marker_size.value.return_value = 3.0
+        controller.session_changed_callbacks = [Mock()]
+        for name in ("fixed_points", "moving_points", "fixed_centers", "moving_centers"):
+            setattr(controller, name, Points(np.array([[10.0, 20.0]])))
+        return controller
+
+    def test_zoom_caps_all_markers_and_preserves_settings_and_coordinates(self) -> None:
+        controller = self._controller()
+        for zoom in (0.5, 1.0, 4.0, 20.0, 100.0, 1.0):
+            with self.subTest(zoom=zoom):
+                controller.viewer.camera.zoom = zoom
+                controller._update_marker_sizes()
+                diameter = min(6.0, 24.0 / zoom)
+                for layer in (controller.fixed_points, controller.moving_points):
+                    np.testing.assert_allclose(layer.size, diameter)
+                    self.assertAlmostEqual(layer.current_size, diameter)
+                    self.assertLessEqual(float(layer.size[0]) * zoom, 24.0)
+                    np.testing.assert_array_equal(layer.data, [[10.0, 20.0]])
+                for layer in (controller.fixed_centers, controller.moving_centers):
+                    np.testing.assert_allclose(layer.size, diameter / 4.0)
+                    self.assertAlmostEqual(layer.current_size, diameter / 4.0)
+        controller.marker_size.setValue.assert_not_called()
+        controller.session_changed_callbacks[0].assert_not_called()
+
+    def test_new_markers_inherit_zoom_adjusted_size(self) -> None:
+        controller = self._controller()
+        controller.viewer.camera.zoom = 100.0
+        controller._update_marker_sizes()
+        for layer in (
+            controller.fixed_points, controller.moving_points,
+            controller.fixed_centers, controller.moving_centers,
+        ):
+            expected = layer.current_size
+            layer.data = np.array([[10.0, 20.0], [10.1, 20.1]])
+            np.testing.assert_allclose(layer.size, expected)
+
+    def test_marker_size_setting_updates_display_and_notifies_once(self) -> None:
+        controller = self._controller()
+        controller.marker_size.value.return_value = 8.0
+        controller.viewer.camera.zoom = 10.0
+        controller._change_marker_size(8.0)
+        np.testing.assert_allclose(controller.fixed_points.size, 2.4)
+        np.testing.assert_allclose(controller.fixed_centers.size, 0.6)
+        controller.session_changed_callbacks[0].assert_called_once_with()
+
+    def test_hit_radius_tracks_visible_circle_at_high_zoom(self) -> None:
+        controller = self._controller()
+        controller._view_mode = "overlay"
+        controller._layer_ids = {"fixed": [1], "moving": [2]}
+        controller.moving_points.visible = False
+        controller.viewer.camera.zoom = 20.0
+        controller._update_marker_sizes()
+        self.assertEqual(
+            controller._pair_id_at_visible_landmark(np.array([10.0, 20.2])), 1
+        )
+        self.assertIsNone(
+            controller._pair_id_at_visible_landmark(np.array([10.0, 20.65]))
+        )
+        controller.viewer.camera.zoom = 1.0
+        controller._update_marker_sizes()
+        self.assertEqual(
+            controller._pair_id_at_visible_landmark(np.array([10.0, 22.5])), 1
+        )
+        self.assertIsNone(
+            controller._pair_id_at_visible_landmark(np.array([10.0, 23.5]))
+        )
 
 
 class CoordinateTests(unittest.TestCase):
@@ -179,6 +323,53 @@ class LandmarkTests(unittest.TestCase):
         self.assertTrue(controller.pairs[1].complete)
         controller._schedule_preview.assert_called_once_with()
 
+    def test_left_then_right_click_can_place_coincident_landmarks(self) -> None:
+        for offset in (0.0, 0.01):
+            with self.subTest(offset=offset):
+                controller = self._canvas_controller()
+                controller._roi_viewing = False
+                controller._sample_selecting = False
+                controller._space_generation = 0
+                controller._space_held = False
+                controller._preview_pending = False
+                controller._view_mode = "overlay"
+                controller.viewer = SimpleNamespace(camera=SimpleNamespace(zoom=20.0))
+                controller.marker_size = Mock()
+                controller.marker_size.value.return_value = 3.0
+                controller.fixed_points = SimpleNamespace(
+                    visible=True, data=np.empty((0, 2))
+                )
+                controller.moving_points = SimpleNamespace(
+                    visible=True, data=np.empty((0, 2))
+                )
+                controller._layer_ids = {"fixed": [], "moving": []}
+                controller._display_to_source_preview_yx = Mock(
+                    side_effect=lambda side, point: tuple(point)
+                )
+                controller._remove_pairs_and_advance = Mock()
+                for button, position in (
+                    (1, (10.0, 20.0)),
+                    (2, (10.0 + offset, 20.0 + offset)),
+                ):
+                    event = SimpleNamespace(
+                        button=button, position=position,
+                        type="mouse_press", handled=False,
+                    )
+                    click = controller._on_canvas_click(controller.viewer, event)
+                    next(click)
+                    event.type = "mouse_release"
+                    with self.assertRaises(StopIteration):
+                        next(click)
+                    if button == 1:
+                        controller.fixed_points.data = np.array([[10.0, 20.0]])
+                        controller._layer_ids["fixed"] = [1]
+                self.assertEqual(controller.pairs[1].fixed_yx, (10.0, 20.0))
+                self.assertEqual(
+                    controller.pairs[1].moving_yx, (10.0 + offset, 20.0 + offset)
+                )
+                controller._remove_pairs_and_advance.assert_not_called()
+                controller._schedule_preview.assert_called_once_with()
+
     def test_preview_factor_reload_preserves_landmarks_and_view(self) -> None:
         controller = RegistrationController.__new__(RegistrationController)
         controller.preview_factor = 4
@@ -277,11 +468,14 @@ class LandmarkTests(unittest.TestCase):
 
     def test_standalone_pair_state_is_saved_and_restored_automatically(self) -> None:
         with TemporaryDirectory() as directory:
-            state_path = Path(directory) / "PAIR_REGISTERED" / "STATE" / "pair.json"
+            root = Path(directory)
+            raw = root / "PAIR"
+            raw.mkdir()
+            state_path = root / "PAIR_REGISTERED" / "STATE" / "pair.json"
             payload = {
                 "format": "napari-tps-register",
-                "fixed": {"path": "/tmp/fixed.tif"},
-                "moving": {"path": "/tmp/moving.tif"},
+                "fixed": {"path": str(raw / "fixed.tif")},
+                "moving": {"path": str(raw / "moving.tif")},
                 "landmarks_full_resolution_yx": [],
             }
             state_path.parent.mkdir(parents=True)
@@ -300,7 +494,12 @@ class LandmarkTests(unittest.TestCase):
                 payload, verify_paths=True
             )
             self.assertEqual(
-                json.loads(state_path.read_text(encoding="utf-8")), payload
+                json.loads(state_path.read_text(encoding="utf-8")),
+                {
+                    **payload,
+                    "fixed": {"path": "PAIR/fixed.tif"},
+                    "moving": {"path": "PAIR/moving.tif"},
+                },
             )
             self.assertIn(
                 controller._save_standalone_state,
@@ -914,6 +1113,50 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(restored, result)
             moving_all.unlink()
             self.assertIsNone(_load_export_manifest(root))
+
+    def test_export_manifest_uses_portable_paths_after_copying_project(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "STR"
+            output_root = root / "STR_REGISTERED"
+            fixed = raw / "fixed.tif"
+            moving = raw / "moving.tif"
+            fixed_band = output_root / "REGISTERED_IMAGES" / "fixed.tif"
+            moving_band = output_root / "REGISTERED_IMAGES" / "moving.tif"
+            for path in (fixed, moving, fixed_band, moving_band):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            result = {
+                "output_directory": str(output_root),
+                "reference_path": str(fixed),
+                "outputs": {
+                    str(fixed): [str(fixed_band)],
+                    str(moving): [str(moving_band)],
+                },
+                "multiband_outputs": {},
+                "source_bboxes": {str(fixed): [0, 1, 0, 1]},
+            }
+
+            manifest_path = _save_export_manifest(result)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["version"], 4)
+            self.assertEqual(manifest["result"]["reference_path"], "STR/fixed.tif")
+            self.assertEqual(
+                manifest["result"]["output_directory"], "STR_REGISTERED"
+            )
+            self.assertNotIn(str(root), manifest_path.read_text(encoding="utf-8"))
+
+            copied_root = root / "copied"
+            shutil.copytree(raw, copied_root / "STR")
+            shutil.copytree(output_root, copied_root / "STR_REGISTERED")
+            restored = _load_export_manifest(copied_root / "STR_REGISTERED")
+
+            self.assertEqual(restored["reference_path"], str(copied_root / "STR" / "fixed.tif"))
+            self.assertTrue(all(
+                Path(path).is_file()
+                for paths in restored["outputs"].values()
+                for path in paths
+            ))
 
     def test_resolution_manifests_coexist_and_filter_stale_signatures(self) -> None:
         with TemporaryDirectory() as directory:

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -12,6 +15,8 @@ from series_registration import (
     RegistrationEdge,
     SeriesImage,
     SeriesRegistrationWidget,
+    _session_with_relative_paths,
+    _session_with_resolved_paths,
     automatic_state_path,
     best_moving_path,
     discover_series,
@@ -20,7 +25,244 @@ from series_registration import (
 )
 
 
+class SeriesPersistenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from qtpy.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _widget(self) -> SeriesRegistrationWidget:
+        controller = Mock(session_changed_callbacks=[])
+        controller.session_dict.return_value = {}
+
+        def load_pair(fixed: Path, moving: Path, session: dict | None) -> None:
+            controller.session_dict.return_value = deepcopy(session) if session else {
+                "fixed": {"path": str(fixed)},
+                "moving": {"path": str(moving)},
+                "landmarks_full_resolution_yx": [],
+            }
+
+        controller.load_image_pair.side_effect = load_pair
+        widget = SeriesRegistrationWidget(controller)
+        self.addCleanup(widget.deleteLater)
+        return widget
+
+    def _directory(self, root: Path) -> Path:
+        directory = root / "Raw"
+        directory.mkdir()
+        for name in ("A_MS.tif", "B_MS.tif", "A_IR.tif"):
+            (directory / name).touch()
+        return directory
+
+    def test_initial_pair_autosaves_and_restores_without_graph_click(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = self._directory(Path(temporary))
+            widget = self._widget()
+            widget.load_directory(directory)
+            self.assertEqual(
+                widget.current_edge,
+                RegistrationEdge(directory / "A_MS.tif", directory / "B_MS.tif"),
+            )
+            session = widget.controller.session_dict.return_value
+            session["landmarks_full_resolution_yx"] = [
+                {"pair_id": 1, "fixed_yx": [10, 20], "moving_yx": [11, 21], "enabled": True}
+            ]
+            widget.controller.session_changed_callbacks[0]()
+            payload = json.loads(automatic_state_path(directory).read_text())
+            self.assertEqual(len(payload["registrations"]), 1)
+            self.assertEqual(
+                payload["registrations"][0]["session"]["landmarks_full_resolution_yx"],
+                session["landmarks_full_resolution_yx"],
+            )
+
+            reopened = self._widget()
+            reopened.load_directory(directory)
+            self.assertEqual(reopened.current_edge, widget.current_edge)
+            self.assertEqual(reopened.controller.session_dict(), session)
+
+    def test_last_active_pair_and_all_sessions_survive_project_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = self._directory(root)
+            widget = self._widget()
+            widget.load_directory(directory)
+            widget.controller.session_dict.return_value["landmarks_full_resolution_yx"] = [
+                {"pair_id": 1, "fixed_yx": [1, 2], "moving_yx": [3, 4]}
+            ]
+            widget._session_changed()
+            widget._activate_edge(directory / "A_MS.tif", directory / "A_IR.tif")
+            widget.controller.session_dict.return_value["landmarks_full_resolution_yx"] = [
+                {"pair_id": 2, "fixed_yx": [5, 6], "moving_yx": [7, 8]}
+            ]
+            widget._session_changed()
+            copied = root / "copied"
+            copied.mkdir()
+            shutil.copytree(directory, copied / directory.name)
+            shutil.copytree(
+                registered_output_directory(directory),
+                copied / registered_output_directory(directory).name,
+            )
+            reopened = self._widget()
+            reopened.load_directory(copied / directory.name)
+            self.assertEqual(reopened.current_edge.moving_path.name, "A_IR.tif")
+            self.assertEqual(reopened.current_edge.fixed_path.parent.parent, copied)
+            self.assertEqual(len(reopened.sessions), 2)
+            self.assertEqual(
+                reopened.controller.session_dict()["landmarks_full_resolution_yx"][0]["pair_id"],
+                2,
+            )
+            reopened._activate_edge(
+                copied / "Raw" / "A_MS.tif", copied / "Raw" / "B_MS.tif"
+            )
+            self.assertEqual(
+                reopened.controller.session_dict()["landmarks_full_resolution_yx"][0]["pair_id"],
+                1,
+            )
+
+    def test_save_state_includes_unsaved_complete_and_incomplete_points_on_all_edges(self) -> None:
+        from napari_tps_register import RegistrationController
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = self._directory(Path(temporary))
+            widget = self._widget()
+            widget.load_directory(directory)
+            first_points = [
+                {"pair_id": 1, "fixed_yx": [1, 2], "moving_yx": [3, 4], "enabled": True},
+                {"pair_id": 2, "fixed_yx": [5, 6], "moving_yx": None, "enabled": False},
+            ]
+            widget.controller.session_dict.return_value[
+                "landmarks_full_resolution_yx"
+            ] = deepcopy(first_points)
+            widget._activate_edge(directory / "A_MS.tif", directory / "A_IR.tif")
+            active_points = [
+                {"pair_id": 3, "fixed_yx": [7, 8], "moving_yx": [9, 10], "enabled": False},
+                {"pair_id": 4, "fixed_yx": [11, 12], "moving_yx": None, "enabled": True},
+            ]
+            widget.controller.session_dict.return_value[
+                "landmarks_full_resolution_yx"
+            ] = deepcopy(active_points)
+
+            widget.controller.series_widget = widget
+            RegistrationController.save_state(widget.controller)
+
+            payload = json.loads(automatic_state_path(directory).read_text())
+            self.assertEqual(len(payload["registrations"]), 2)
+            self.assertEqual(
+                [
+                    item["session"]["landmarks_full_resolution_yx"]
+                    for item in payload["registrations"]
+                ],
+                [first_points, active_points],
+            )
+            reopened = self._widget()
+            reopened.load_directory(directory)
+            self.assertEqual(
+                reopened.controller.session_dict()["landmarks_full_resolution_yx"],
+                active_points,
+            )
+            reopened._activate_edge(directory / "A_MS.tif", directory / "B_MS.tif")
+            self.assertEqual(
+                reopened.controller.session_dict()["landmarks_full_resolution_yx"],
+                first_points,
+            )
+
+    def test_older_state_without_active_pair_restores_saved_landmarks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = self._directory(Path(temporary))
+            widget = self._widget()
+            widget.load_directory(directory)
+            state_path = automatic_state_path(directory)
+            payload = json.loads(state_path.read_text())
+            payload.pop("active_registration")
+            registration = payload["registrations"][0]
+            registration["moving_path"] = "Raw/A_IR.tif"
+            registration["session"]["moving"]["path"] = "Raw/A_IR.tif"
+            registration["session"]["landmarks_full_resolution_yx"] = [
+                {"pair_id": 3, "fixed_yx": [10, 20], "moving_yx": [11, 21]}
+            ]
+            state_path.write_text(json.dumps(payload))
+            reopened = self._widget()
+            reopened.load_directory(directory)
+            self.assertEqual(reopened.current_edge.moving_path.name, "A_IR.tif")
+            self.assertEqual(
+                reopened.controller.session_dict()["landmarks_full_resolution_yx"][0]["pair_id"],
+                3,
+            )
+
+    def test_invalid_state_is_reported_without_overwriting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = self._directory(Path(temporary))
+            state_path = automatic_state_path(directory)
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text('{"format": "napari-tps-register-series",')
+            original = state_path.read_bytes()
+            widget = self._widget()
+            with self.assertRaisesRegex(ValueError, "Unable to load saved series state"):
+                widget.load_directory(directory)
+            self.assertEqual(state_path.read_bytes(), original)
+            widget.controller.load_image_pair.assert_not_called()
+            self.assertIsNone(widget.directory)
+
+    def test_failed_pair_load_does_not_replace_saved_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = self._directory(Path(temporary))
+            initial = self._widget()
+            initial.load_directory(directory)
+            original = automatic_state_path(directory).read_bytes()
+            reopened = self._widget()
+            reopened.controller.load_image_pair.side_effect = OSError("Unreadable TIFF")
+            with self.assertRaisesRegex(OSError, "Unreadable TIFF"):
+                reopened.load_directory(directory)
+            self.assertEqual(automatic_state_path(directory).read_bytes(), original)
+            self.assertIsNone(reopened.current_edge)
+
+    def test_missing_source_does_not_discard_saved_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = self._directory(Path(temporary))
+            widget = self._widget()
+            widget.load_directory(directory)
+            original = automatic_state_path(directory).read_bytes()
+            (directory / "B_MS.tif").unlink()
+            reopened = self._widget()
+            with self.assertRaisesRegex(ValueError, "missing source images"):
+                reopened.load_directory(directory)
+            self.assertEqual(automatic_state_path(directory).read_bytes(), original)
+            reopened.controller.load_image_pair.assert_not_called()
+
+    def test_initial_save_failure_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = self._directory(Path(temporary))
+            widget = self._widget()
+            widget._write_state_file = Mock(return_value=False)
+            with self.assertRaisesRegex(OSError, "Unable to save the active registration"):
+                widget.load_directory(directory)
+
+
 class SeriesDiscoveryTests(unittest.TestCase):
+    def test_session_paths_are_portable_and_legacy_paths_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            raw = parent / "STR"
+            raw.mkdir()
+            fixed = raw / "fixed_MS.tif"
+            moving = raw / "moving_MS.tif"
+            session = {
+                "fixed": {"path": str(fixed)},
+                "moving": {"path": str(moving)},
+            }
+
+            portable = _session_with_relative_paths(session, parent)
+
+            self.assertEqual(portable["fixed"]["path"], "STR/fixed_MS.tif")
+            self.assertEqual(portable["moving"]["path"], "STR/moving_MS.tif")
+            self.assertEqual(
+                _session_with_resolved_paths(portable, parent), session
+            )
+            self.assertEqual(
+                _session_with_resolved_paths(session, parent), session
+            )
+
     def test_state_path_uses_registered_sibling_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

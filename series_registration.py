@@ -8,6 +8,7 @@ persistence. Image loading and landmark registration remain owned by
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
@@ -25,6 +26,7 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -37,6 +39,41 @@ if TYPE_CHECKING:
 IMAGE_SUFFIXES = {".tif", ".tiff"}
 KNOWN_MODALITIES = ("MS", "IR")
 STATE_FILENAME = "manual_registration_state.json"
+
+
+def _relative_path(path: Path, base_directory: Path) -> str:
+    """Return a portable path from the common Raw/REGISTERED parent."""
+    return str(Path(path).resolve().relative_to(base_directory.resolve()))
+
+
+def _resolve_saved_path(path: str, base_directory: Path) -> Path:
+    """Resolve a portable path, while retaining legacy absolute-path support."""
+    candidate = Path(path)
+    return candidate.resolve() if candidate.is_absolute() else (base_directory / candidate).resolve()
+
+
+def _session_with_relative_paths(
+    session: dict[str, Any], base_directory: Path
+) -> dict[str, Any]:
+    """Copy one session, replacing its source paths with portable references."""
+    saved = deepcopy(session)
+    for role in ("fixed", "moving"):
+        source = saved.get(role)
+        if isinstance(source, dict) and source.get("path"):
+            source["path"] = _relative_path(Path(source["path"]), base_directory)
+    return saved
+
+
+def _session_with_resolved_paths(
+    session: dict[str, Any], base_directory: Path
+) -> dict[str, Any]:
+    """Copy one session, resolving new relative or legacy absolute source paths."""
+    restored = deepcopy(session)
+    for role in ("fixed", "moving"):
+        source = restored.get(role)
+        if isinstance(source, dict) and source.get("path"):
+            source["path"] = str(_resolve_saved_path(source["path"], base_directory))
+    return restored
 
 
 def registered_output_directory(directory: Path) -> Path:
@@ -265,50 +302,89 @@ class SeriesRegistrationWidget(QGroupBox):
             self, "Open series directory", str(self.directory or Path.cwd())
         )
         if selected:
-            self.load_directory(Path(selected))
+            try:
+                self.load_directory(Path(selected))
+            except (OSError, ValueError) as error:
+                QMessageBox.critical(self, "Unable to open series", str(error))
 
     def load_directory(self, directory: Path) -> None:
-        if self.directory is not None:
-            self.save_state(show_status=False)
+        if self.directory is not None and not self.save_state(show_status=False):
+            raise OSError("Unable to save the current series before opening a directory.")
+        directory = directory.resolve()
         images, warnings = discover_series(directory)
-        self.directory = directory.resolve()
-        self.state_path = automatic_state_path(self.directory)
-        self.images = images
-        self.sessions.clear()
-        self.edges.clear()
-        self.current_edge = None
-        self.first_selection = None
+        state_path = automatic_state_path(directory)
+        sessions: dict[str, dict[str, Any]] = {}
+        edges: dict[str, RegistrationEdge] = {}
+        active_edge: Optional[RegistrationEdge] = None
         restored = 0
-        state_warning = ""
-        state_source = self.state_path
+        state_source = state_path
         if not state_source.exists():
             state_source = next(
-                (path for path in _legacy_state_paths(self.directory) if path.exists()),
+                (path for path in _legacy_state_paths(directory) if path.exists()),
                 state_source,
             )
         if state_source.exists():
             try:
                 payload = json.loads(state_source.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("the saved state must be a JSON object")
                 if payload.get("format") != "napari-tps-register-series":
                     raise ValueError("unrecognized file format")
                 available = {image.path for image in images}
                 for item in payload.get("registrations", []):
                     edge = RegistrationEdge(
-                        Path(item["fixed_path"]).resolve(),
-                        Path(item["moving_path"]).resolve(),
+                        _resolve_saved_path(item["fixed_path"], directory.parent),
+                        _resolve_saved_path(item["moving_path"], directory.parent),
                     )
                     if edge.fixed_path not in available or edge.moving_path not in available:
-                        continue
-                    self.edges[edge.key] = edge
-                    self.sessions[edge.key] = item.get("session", {})
+                        raise ValueError(
+                            "Saved registration refers to missing source images: "
+                            f"{edge.fixed_path.name} -> {edge.moving_path.name}"
+                        )
+                    session = item.get("session", {})
+                    if not isinstance(session, dict):
+                        raise ValueError("the saved registration session must be an object")
+                    edges[edge.key] = edge
+                    sessions[edge.key] = _session_with_resolved_paths(
+                        session, directory.parent
+                    )
                     restored += 1
+                saved_active = payload.get("active_registration")
+                if saved_active is not None:
+                    saved_edge = RegistrationEdge(
+                        _resolve_saved_path(saved_active["fixed_path"], directory.parent),
+                        _resolve_saved_path(saved_active["moving_path"], directory.parent),
+                    )
+                    active_edge = edges.get(saved_edge.key)
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
-                state_warning = f" — state not loaded: {error}"
+                raise ValueError(
+                    f"Unable to load saved series state {state_source}: {error}"
+                ) from error
+        if active_edge is None:
+            active_edge = next(iter(edges.values()), None)
+        if active_edge is None and len(images) >= 2:
+            preferred = sorted(
+                (image for image in images if image.modality == "MS"),
+                key=lambda image: image.scene,
+            )
+            initial = preferred if len(preferred) >= 2 else sorted(
+                images, key=lambda image: (image.scene, image.modality)
+            )
+            active_edge = RegistrationEdge(initial[0].path, initial[1].path)
+        self.directory = directory
+        self.state_path = state_path
+        self.images = images
+        self.sessions = sessions
+        self.edges = edges
+        self.current_edge = None
+        self.first_selection = None
         self._rebuild_scene()
+        if active_edge is not None:
+            self._activate_edge(active_edge.fixed_path, active_edge.moving_path)
         warning_text = f" — {len(warnings)} warning(s)" if warnings else ""
         self.status.setText(
             f"{len(images)} image(s), {restored} pair(s) restored"
-            f"{warning_text}{state_warning}. Left-click FIXED; "
+            f"{warning_text}. Left-click FIXED; "
             "right-click to override MOVING."
         )
         tooltip_lines = [f"Automatic state file: {self.state_path}"]
@@ -419,11 +495,9 @@ class SeriesRegistrationWidget(QGroupBox):
 
     def _activate_edge(self, fixed_path: Path, moving_path: Path) -> None:
         self._store_current_session()
-        self._write_state_file()
+        if self.current_edge is not None and not self._write_state_file():
+            raise OSError(f"Unable to save the current registration to {self.state_path}")
         edge = RegistrationEdge(fixed_path, moving_path)
-        self.edges[edge.key] = edge
-        self.current_edge = edge
-        self.first_selection = None
         self._loading_pair = True
         try:
             self.controller.load_image_pair(
@@ -433,11 +507,15 @@ class SeriesRegistrationWidget(QGroupBox):
             )
         finally:
             self._loading_pair = False
+        self.edges[edge.key] = edge
+        self.current_edge = edge
+        self.first_selection = None
         self._refresh_node_roles()
         self._ensure_edge_line(edge)
         self._refresh_edges()
         self._store_current_session()
-        self._write_state_file()
+        if not self._write_state_file():
+            raise OSError(f"Unable to save the active registration to {self.state_path}")
         self.status.setText(
             f"Active edge: FIXED {edge.fixed_path.name} → MOVING {edge.moving_path.name}"
         )
@@ -510,6 +588,7 @@ class SeriesRegistrationWidget(QGroupBox):
             line.setPen(QPen(QColor(color), 4))
 
     def project_dict(self) -> dict[str, Any]:
+        """Return the absolute-path project used by the active process."""
         self._store_current_session()
         return {
             "format": "napari-tps-register-series",
@@ -533,6 +612,52 @@ class SeriesRegistrationWidget(QGroupBox):
             ],
         }
 
+    def state_dict(self) -> dict[str, Any]:
+        """Return the portable representation written under ``*_REGISTERED``."""
+        project = self.project_dict()
+        if self.directory is None:
+            return project
+        base_directory = self.directory.parent
+        return {
+            **project,
+            "version": 2,
+            "directory": _relative_path(self.directory, base_directory),
+            "active_registration": (
+                {
+                    "fixed_path": _relative_path(
+                        self.current_edge.fixed_path, base_directory
+                    ),
+                    "moving_path": _relative_path(
+                        self.current_edge.moving_path, base_directory
+                    ),
+                }
+                if self.current_edge is not None
+                else None
+            ),
+            "images": [
+                {
+                    **image,
+                    "path": _relative_path(Path(image["path"]), base_directory),
+                }
+                for image in project["images"]
+            ],
+            "registrations": [
+                {
+                    **registration,
+                    "fixed_path": _relative_path(
+                        Path(registration["fixed_path"]), base_directory
+                    ),
+                    "moving_path": _relative_path(
+                        Path(registration["moving_path"]), base_directory
+                    ),
+                    "session": _session_with_relative_paths(
+                        registration.get("session", {}), base_directory
+                    ),
+                }
+                for registration in project["registrations"]
+            ],
+        }
+
     def _write_state_file(self) -> bool:
         if self.state_path is None:
             return False
@@ -540,7 +665,7 @@ class SeriesRegistrationWidget(QGroupBox):
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
             temporary.write_text(
-                json.dumps(self.project_dict(), indent=2), encoding="utf-8"
+                json.dumps(self.state_dict(), indent=2), encoding="utf-8"
             )
             temporary.replace(self.state_path)
             return True

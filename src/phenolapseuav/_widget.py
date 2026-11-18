@@ -19,8 +19,10 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from phenolapseuav._panel import RegistrationPanel
 
-class PhenolapseUAVWidget(QWidget):
+
+class PhenolapseUAVWidget(RegistrationPanel):
     """Launch the landmark-registration controller inside an existing viewer."""
 
     def __init__(self, napari_viewer: Any) -> None:
@@ -251,7 +253,7 @@ class PhenolapseUAVWidget(QWidget):
             RasterioSource(moving_path),
             self.preview_factor.value(),
         )
-        self.layout().insertWidget(0, self.controller.widget)
+        self.layout().insertWidget(0, self.controller.widget, 1)
         self.launch_widget.setVisible(False)
         return self.controller
 

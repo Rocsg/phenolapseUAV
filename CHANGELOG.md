@@ -6,6 +6,26 @@ All notable changes to phenolapseUAV are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-11-18
+
+### Changed
+
+- Added an always-visible panel scrollbar and a direct registration-graph button.
+- Registration panels initially request one third of the window width and use
+  the available height while remaining resizable.
+- Landmark circles and centers are more visible and shrink in image units at
+  high zoom, with a 24-screen-pixel circle diameter limit.
+
+### Fixed
+
+- Activate the initial series registration immediately so landmarks placed
+  before clicking the graph are saved.
+- Restore the last active registration and all saved landmarks when reopening
+  a series, including incomplete and disabled pairs.
+- Report unreadable state files and missing source images without silently
+  replacing saved registrations.
+- Keep landmark hit detection consistent with the displayed circle size.
+
 ## [1.0.2] - 2026-08-29
 
 ### Added
@@ -66,6 +86,7 @@ All notable changes to phenolapseUAV are documented here. The format follows
 - 512 × 512 multi-image validation stack export.
 - Automatic pairwise and series registration command-line tools.
 
-[Unreleased]: https://github.com/Rocsg/phenolapseUAV/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/Rocsg/phenolapseUAV/compare/v1.0.5...HEAD
+[1.0.5]: https://github.com/Rocsg/phenolapseUAV/compare/v1.0.4...v1.0.5
 [1.0.0]: https://github.com/Rocsg/phenolapseUAV/compare/v0.1.0...v1.0.0
 [0.1.0]: https://github.com/Rocsg/phenolapseUAV/releases/tag/v0.1.0

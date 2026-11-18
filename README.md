@@ -37,6 +37,31 @@ python -m pip install "phenolapseUAV[automatic]"
 AROSICS and GDAL availability depends on the operating system. The interactive
 napari plugin does not require AROSICS.
 
+## Lancement rapide en local
+
+Si vous voulez juste lancer l'application sans vous prendre la tête, le plus simple est de créer un venv, installer le paquet en editable, puis démarrer le lanceur GUI fourni par le projet:
+
+```bash
+cd phenolapseUAV
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e ".[dev]"
+phenolapseUAV-gui
+```
+
+Cette commande ouvre napari avec le panneau **PhenoLapseUAV registration** déjà docké à droite.
+
+Si vous préférez ouvrir napari d'abord puis charger le plugin à la main, lancez simplement:
+
+```bash
+napari
+```
+
+Puis ouvrez **Plugins > phenolapseUAV Registration** dans l'interface.
+
+Le point d'entrée historique `phenolapseUAV` ouvre aussi napari avec le widget de recalage, via la barre de commandes ou un terminal déjà placé dans le bon environnement Python.
+
 ## Quick start
 
 Open **Plugins > phenolapseUAV Registration**, then either select one FIXED and
@@ -98,6 +123,15 @@ phenolapseUAV \
 
 `--dir` and the `--fixed`/`--moving` pair are mutually exclusive.
 
+The right-hand registration panel initially requests about one third of the
+napari window width and fills the available dock height. It adapts when the
+window is resized or maximized; its width remains manually adjustable.
+The panel has an always-visible vertical scrollbar.
+Use it to reach controls below the visible area on smaller screens, or click
+**Registration graph** at the top of the panel to jump directly to the
+registration chain. The graph has its own horizontal and vertical scrollbars
+when the series exceeds its visible area.
+
 When opened from napari, the plugin first presents two workflows: alignment of two images or orthoimages, and alignment of a time-lapse series. Selecting a workflow dismisses the centered welcome message and reveals only the corresponding file controls. In standalone two-image mode, opening FIXED and MOVING immediately creates a deterministic JSON state file under the sibling `<moving-folder>_REGISTERED/STATE` directory. Selecting the same ordered pair later restores its landmarks and settings automatically; every subsequent edit is saved atomically.
 
 ### Landmark input
@@ -125,7 +159,7 @@ Input works anywhere on the canvas, independently of the displayed view or activ
 
 The application starts in the red/green overlay view.
 
-Every landmark has a stable visible ID. FIXED markers are slightly red-tinted white and MOVING markers are slightly green-tinted white. Both are semi-transparent and include a fully saturated red or green center. Their initial diameter is 3 and can be adjusted with **Landmark size** for precise placement.
+Every landmark has a stable visible ID. FIXED markers are slightly red-tinted white and MOVING markers are slightly green-tinted white. Both are semi-transparent and include a fully saturated red or green center. **Landmark size** defaults to 3; the visible diameter is twice this value in preview units for improved visibility, including in restored sessions. When zooming in, their diameter is capped at 24 screen pixels, so the circles cover less of the image at high magnification. Their centers shrink proportionally, and the hover/deletion radius follows the visible circle with a minimum 3-screen-pixel radius for small markers. Zooming does not change saved landmark coordinates or the chosen size setting.
 
 Deleting a landmark removes its complete pair without silently reassigning later IDs. Moving, deleting, or disabling a complete pair starts an asynchronous preview update. An isolated FIXED click does not trigger registration: computation starts only after a complete pair is validated. A large **UPDATING VIEW…** message appears at the center of the canvas during computation. Landmark placement and movement are locked during this update, while view navigation remains available. Stale worker results are ignored. The point table automatically scrolls to the latest coordinates.
 
@@ -147,9 +181,16 @@ The **Manual registration series** panel below the landmark table manages multip
 6. Right-clicking another node overrides MOVING while preserving the current FIXED image. The selected MOVING node receives a green frame.
 7. Switching edges stores the previous edge's landmarks in memory and restores the new edge if it was edited earlier.
 
+Opening a series immediately activates a registration pair, so points placed
+without first clicking the graph are also saved automatically. Reopening the
+directory restores the last active pair and its landmarks. Older state files
+without an active-pair entry open their first saved registration; a new series
+starts with the first two MS images when available. An unreadable state file
+is reported as an error rather than replaced with an empty project.
+
 Potential edges are dark. An edited edge changes color according to its number of complete pairs: 1, 4 (similarity), 7 (residual affine), and 10 (residual TPS). Every landmark edit and edge change automatically saves the complete state. **Save state** forces the same write without asking for a filename.
 
-For an input directory such as `Input/STR`, every generated file is stored in the deterministic sibling directory `Input/STR_REGISTERED`. Registration state is saved under `STR_REGISTERED/STATE/manual_registration_state.json`. The file contains image metadata, directed FIXED→MOVING edges, and full-resolution coordinates. Existing state from the former `OUTPUT` layout is still read for backward compatibility and is migrated to the new location on the next save.
+For an input directory such as `Input/STR`, every generated file is stored in the deterministic sibling directory `Input/STR_REGISTERED`. Registration state is saved under `STR_REGISTERED/STATE/manual_registration_state.json`. Paths in this state file and in export-completion manifests are relative to their shared parent (for example, `STR/image_MS.tif` and `STR_REGISTERED/REGISTERED_IMAGES/...`), so copying the two sibling directories preserves a reusable project. Older JSON files containing absolute paths are still accepted on read and are rewritten in the portable format on the next save or export. Existing state from the former `OUTPUT` layout is also still read for backward compatibility and is migrated to the new location on the next save.
 
 Manual registration always starts with GeoTIFF georeferencing and pixel sizes. Landmark corrections are then fitted successively on the remaining residuals: a fallback translation for 1–3 pairs, similarity from 4 pairs, affine after similarity from 7 pairs, and TPS after similarity and affine from 10 pairs. The same composed mapping is used for preview, interaction, and full-resolution export. Full-resolution export requires 10 pairs and processes spectral bands separately with one shared spatial transformation and no interpolation between channels.
 
@@ -301,6 +342,26 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution rules.
   using trusted publishing.
 6. Connect the GitHub repository to Zenodo before the first public release to
   obtain both release and concept DOIs.
+
+For version 1.0.5, after reviewing and committing the intended changes on `main`:
+
+```bash
+git push origin main
+git tag -a v1.0.5 -m "Release 1.0.5"
+git push origin v1.0.5
+gh release create v1.0.5 --verify-tag --title "1.0.5" --generate-notes
+```
+
+Publishing the GitHub release triggers the workflow; pushing the tag alone
+does not publish to PyPI. Check the **Publish release** GitHub Actions run and
+approve the `pypi` environment deployment if approval is required.
+Do not also upload the same version manually with twine.
+
+The napari plugin manager discovers releases through PyPI using the packaged
+`napari.manifest` entry point; no separate napari package upload is needed.
+After indexing, users can update through **Plugins > Install/Uninstall Plugins**
+or run `python -m pip install --upgrade phenolapseuav` in their napari environment.
+Restart napari after updating.
 
 The PyPI project owner must configure a trusted publisher for repository
 `Rocsg/phenolapseUAV`, workflow `publish.yml`, environment `pypi`.

@@ -32,6 +32,7 @@ EXPORT_SUBSAMPLE_FACTORS = (1, 2, 4)
 DEFAULT_EXPORT_WORKERS = 4
 DEFAULT_EXPORT_SUBSAMPLE = 4
 CROP_PADDING_PIXELS = 5
+MAX_LANDMARK_DIAMETER_PIXELS = 24.0
 
 
 @dataclass
@@ -1503,8 +1504,8 @@ def _save_export_manifest(result: dict[str, Any]) -> Path:
     manifest_path = state_directory / EXPORT_MANIFEST_FILENAME
     payload = {
         "format": "phenolapseuav-export",
-        "version": 3,
-        "result": result,
+        "version": 4,
+        "result": _portable_export_result(result, output_directory.parent),
     }
     resolution = result.get(
         "resolution",
@@ -1522,6 +1523,79 @@ def _save_export_manifest(result: dict[str, Any]) -> Path:
     return manifest_path
 
 
+def _portable_export_path(path: str | Path, base_directory: Path) -> str:
+    """Store a path relative to the common Raw/REGISTERED parent."""
+    return str(Path(path).resolve().relative_to(base_directory.resolve()))
+
+
+def _resolve_export_path(path: str | Path, base_directory: Path) -> str:
+    """Resolve a portable path, while accepting legacy absolute path values."""
+    candidate = Path(path)
+    return str(candidate.resolve() if candidate.is_absolute() else (base_directory / candidate).resolve())
+
+
+def _portable_export_result(
+    result: dict[str, Any], base_directory: Path
+) -> dict[str, Any]:
+    """Return a manifest-only copy whose source and output paths are portable."""
+    saved = dict(result)
+    saved["output_directory"] = _portable_export_path(
+        result["output_directory"], base_directory
+    )
+    saved["reference_path"] = _portable_export_path(
+        result["reference_path"], base_directory
+    )
+    saved["outputs"] = {
+        _portable_export_path(source, base_directory): [
+            _portable_export_path(path, base_directory) for path in paths
+        ]
+        for source, paths in result["outputs"].items()
+    }
+    saved["multiband_outputs"] = {
+        _portable_export_path(source, base_directory): _portable_export_path(
+            path, base_directory
+        )
+        for source, path in result.get("multiband_outputs", {}).items()
+    }
+    if "source_bboxes" in result:
+        saved["source_bboxes"] = {
+            _portable_export_path(source, base_directory): bbox
+            for source, bbox in result["source_bboxes"].items()
+        }
+    return saved
+
+
+def _resolved_export_result(
+    result: dict[str, Any], base_directory: Path
+) -> dict[str, Any]:
+    """Return a runtime copy with portable or legacy paths made absolute."""
+    restored = dict(result)
+    restored["output_directory"] = _resolve_export_path(
+        result["output_directory"], base_directory
+    )
+    restored["reference_path"] = _resolve_export_path(
+        result["reference_path"], base_directory
+    )
+    restored["outputs"] = {
+        _resolve_export_path(source, base_directory): [
+            _resolve_export_path(path, base_directory) for path in paths
+        ]
+        for source, paths in result["outputs"].items()
+    }
+    restored["multiband_outputs"] = {
+        _resolve_export_path(source, base_directory): _resolve_export_path(
+            path, base_directory
+        )
+        for source, path in result.get("multiband_outputs", {}).items()
+    }
+    if "source_bboxes" in result:
+        restored["source_bboxes"] = {
+            _resolve_export_path(source, base_directory): bbox
+            for source, bbox in result["source_bboxes"].items()
+        }
+    return restored
+
+
 def _load_export_manifest_path(manifest_path: Path) -> Optional[dict[str, Any]]:
     """Load one manifest only when every recorded output still exists."""
     if not manifest_path.is_file():
@@ -1530,7 +1604,12 @@ def _load_export_manifest_path(manifest_path: Path) -> Optional[dict[str, Any]]:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if payload.get("format") != "phenolapseuav-export":
             return None
-        result = payload["result"]
+        state_directory = next(
+            (parent for parent in manifest_path.parents if parent.name == "STATE"),
+            None,
+        )
+        base_directory = state_directory.parent.parent if state_directory else manifest_path.parent
+        result = _resolved_export_result(payload["result"], base_directory)
         paths = [
             Path(path)
             for image_outputs in result["outputs"].values()
@@ -1950,8 +2029,10 @@ class RegistrationController:
             QGroupBox,
             QHBoxLayout,
             QLabel,
+            QLayout,
             QMessageBox,
             QPushButton,
+            QScrollArea,
             QSpinBox,
             QTableWidget,
             QTableWidgetItem,
@@ -2079,8 +2160,28 @@ class RegistrationController:
         self._text_generations[id(self.fixed_points)] = 0
         self._text_generations[id(self.moving_points)] = 0
 
-        self.widget = QWidget()
-        layout = QVBoxLayout(self.widget)
+        from phenolapseuav._panel import RegistrationPanel
+
+        self.widget = RegistrationPanel()
+        panel_layout = QVBoxLayout(self.widget)
+        self.graph_button = QPushButton("Registration graph")
+        self.graph_button.setToolTip(
+            "Scroll to the registration chain at the bottom of the panel."
+        )
+        panel_layout.addWidget(self.graph_button)
+        self.panel_scroll = QScrollArea()
+        self.panel_scroll.setWidgetResizable(True)
+        self.panel_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+        )
+        self.panel_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        panel_content = QWidget()
+        layout = QVBoxLayout(panel_content)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.panel_scroll.setWidget(panel_content)
+        panel_layout.addWidget(self.panel_scroll, stretch=1)
         legend = QLabel(
             "<b><span style='color:#ff5555'>FIXED — red — left click</span>"
             " &nbsp;→&nbsp; "
@@ -2145,7 +2246,10 @@ class RegistrationController:
         self.marker_size.setSingleStep(0.5)
         self.marker_size.setDecimals(1)
         self.marker_size.setValue(3.0)
-        self.marker_size.setToolTip("Circle diameter in preview units")
+        self.marker_size.setToolTip(
+            "Circle diameter is twice this value in preview units; "
+            "capped at 24 screen pixels when zooming in."
+        )
         self.marker_size.valueChanged.connect(self._change_marker_size)
         marker_row.addWidget(self.marker_size)
         marker_row.addStretch(1)
@@ -2349,6 +2453,9 @@ class RegistrationController:
 
         self.series_widget = SeriesRegistrationWidget(self)
         layout.addWidget(self.series_widget, stretch=1)
+        self.graph_button.clicked.connect(
+            lambda: self.panel_scroll.ensureWidgetVisible(self.series_widget)
+        )
         viewer.mouse_drag_callbacks.insert(0, self._on_canvas_click)
         viewer.mouse_move_callbacks.append(self._on_canvas_move)
         viewer.bind_key("n", self.start_next_pair, overwrite=True)
@@ -2361,6 +2468,8 @@ class RegistrationController:
         self.moving_points.bind_key("Delete", self.delete_last_pair, overwrite=True)
         self.fixed_centers.bind_key("Delete", self.delete_last_pair, overwrite=True)
         self.moving_centers.bind_key("Delete", self.delete_last_pair, overwrite=True)
+        viewer.camera.events.zoom.connect(self._update_marker_sizes)
+        self._update_marker_sizes()
         self.show_overlay()
         self._restore_existing_export()
 
@@ -2475,7 +2584,7 @@ class RegistrationController:
         else:
             candidates = (("fixed", self.fixed_points),)
         zoom = max(float(self.viewer.camera.zoom), 1e-9)
-        tolerance = 8.0 / zoom
+        tolerance = max(3.0 / zoom, self._marker_diameter_preview() / 2.0)
         nearest: Optional[tuple[float, int]] = None
         for side, layer in candidates:
             if not layer.visible or len(layer.data) == 0:
@@ -2904,13 +3013,28 @@ class RegistrationController:
         self._set_preview_pending(False)
         self.status.setText(f"Preview update failed: {error}")
 
+    def _marker_diameter_preview(self) -> float:
+        zoom = max(float(self.viewer.camera.zoom), 1e-9)
+        return min(
+            2.0 * float(self.marker_size.value()), MAX_LANDMARK_DIAMETER_PIXELS / zoom
+        )
+
+    def _update_marker_sizes(self, *_: Any) -> None:
+        """Shrink markers in image units when their screen diameter reaches the cap."""
+        base_size = float(self.marker_size.value())
+        diameter = self._marker_diameter_preview()
+        center_size = max(0.5, base_size / 4.0) * diameter / base_size
+        for layer, size in (
+            (self.fixed_points, diameter),
+            (self.moving_points, diameter),
+            (self.fixed_centers, center_size),
+            (self.moving_centers, center_size),
+        ):
+            layer.current_size = size
+            layer.size = size
+
     def _change_marker_size(self, value: float) -> None:
-        """Apply one precise display size to both landmark families."""
-        self.fixed_points.size = value
-        self.moving_points.size = value
-        center_size = max(0.5, value / 4.0)
-        self.fixed_centers.size = center_size
-        self.moving_centers.size = center_size
+        self._update_marker_sizes()
         for callback in tuple(self.session_changed_callbacks):
             callback()
 
@@ -3368,6 +3492,8 @@ class RegistrationController:
 
     def configure_standalone_state(self, state_path: Path) -> bool:
         """Restore and continuously save one standalone FIXED/MOVING pair."""
+        from series_registration import _session_with_resolved_paths
+
         self.standalone_state_path = state_path.resolve()
         restored = False
         state_error: Optional[Exception] = None
@@ -3376,7 +3502,12 @@ class RegistrationController:
                 payload = json.loads(
                     self.standalone_state_path.read_text(encoding="utf-8")
                 )
-                self.load_session_payload(payload, verify_paths=True)
+                self.load_session_payload(
+                    _session_with_resolved_paths(
+                        payload, self.standalone_state_path.parent.parent.parent
+                    ),
+                    verify_paths=True,
+                )
                 restored = True
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
                 state_error = error
@@ -3403,12 +3534,21 @@ class RegistrationController:
         if self.standalone_state_path is None:
             return False
         try:
+            from series_registration import _session_with_relative_paths
+
             self.standalone_state_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.standalone_state_path.with_suffix(
                 self.standalone_state_path.suffix + ".tmp"
             )
             temporary.write_text(
-                json.dumps(self.session_dict(), indent=2), encoding="utf-8"
+                json.dumps(
+                    _session_with_relative_paths(
+                        self.session_dict(),
+                        self.standalone_state_path.parent.parent.parent,
+                    ),
+                    indent=2,
+                ),
+                encoding="utf-8",
             )
             temporary.replace(self.standalone_state_path)
             return True
@@ -3575,7 +3715,12 @@ class RegistrationController:
             pointer_path.parent.mkdir(parents=True, exist_ok=True)
             pointer_path.write_text(
                 json.dumps(
-                    {"output_directory": result["output_directory"]}, indent=2
+                    {
+                        "output_directory": _portable_export_path(
+                            result["output_directory"], pointer_path.parent.parent
+                        )
+                    },
+                    indent=2,
                 ),
                 encoding="utf-8",
             )
@@ -3947,7 +4092,13 @@ class RegistrationController:
                 continue
             try:
                 pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-                candidates.append(Path(pointer["output_directory"]))
+                candidates.append(
+                    Path(
+                        _resolve_export_path(
+                            pointer["output_directory"], pointer_path.parent.parent
+                        )
+                    )
+                )
             except (OSError, KeyError, TypeError, json.JSONDecodeError):
                 pass
         if self.series_widget.state_path is not None:
