@@ -468,7 +468,7 @@ class LandmarkTests(unittest.TestCase):
 
     def test_standalone_pair_state_is_saved_and_restored_automatically(self) -> None:
         with TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             raw = root / "PAIR"
             raw.mkdir()
             state_path = root / "PAIR_REGISTERED" / "STATE" / "pair.json"
@@ -1083,7 +1083,7 @@ class ExportTests(unittest.TestCase):
 
     def test_completed_export_manifest_can_be_restored(self) -> None:
         with TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             fixed = root / "fixed.tif"
             moving = root / "moving.tif"
             fixed_band = root / "fixed_B01_registered.tif"
@@ -1116,7 +1116,7 @@ class ExportTests(unittest.TestCase):
 
     def test_export_manifest_uses_portable_paths_after_copying_project(self) -> None:
         with TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             raw = root / "STR"
             output_root = root / "STR_REGISTERED"
             fixed = raw / "fixed.tif"

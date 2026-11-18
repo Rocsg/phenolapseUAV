@@ -18,6 +18,8 @@ All notable changes to phenolapseUAV are documented here. The format follows
 
 ### Fixed
 
+- Serialize portable project and export paths with forward slashes on Windows
+  and compare canonical paths in persistence tests, including Windows 8.3 paths.
 - Activate the initial series registration immediately so landmarks placed
   before clicking the graph are saved.
 - Restore the last active registration and all saved landmarks when reopening

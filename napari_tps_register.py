@@ -1525,7 +1525,7 @@ def _save_export_manifest(result: dict[str, Any]) -> Path:
 
 def _portable_export_path(path: str | Path, base_directory: Path) -> str:
     """Store a path relative to the common Raw/REGISTERED parent."""
-    return str(Path(path).resolve().relative_to(base_directory.resolve()))
+    return Path(path).resolve().relative_to(base_directory.resolve()).as_posix()
 
 
 def _resolve_export_path(path: str | Path, base_directory: Path) -> str:

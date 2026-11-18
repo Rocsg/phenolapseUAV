@@ -49,7 +49,7 @@ class SeriesPersistenceTests(unittest.TestCase):
         return widget
 
     def _directory(self, root: Path) -> Path:
-        directory = root / "Raw"
+        directory = root.resolve() / "Raw"
         directory.mkdir()
         for name in ("A_MS.tif", "B_MS.tif", "A_IR.tif"):
             (directory / name).touch()
@@ -83,7 +83,7 @@ class SeriesPersistenceTests(unittest.TestCase):
 
     def test_last_active_pair_and_all_sessions_survive_project_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             directory = self._directory(root)
             widget = self._widget()
             widget.load_directory(directory)
@@ -242,7 +242,7 @@ class SeriesPersistenceTests(unittest.TestCase):
 class SeriesDiscoveryTests(unittest.TestCase):
     def test_session_paths_are_portable_and_legacy_paths_are_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            parent = Path(temporary)
+            parent = Path(temporary).resolve()
             raw = parent / "STR"
             raw.mkdir()
             fixed = raw / "fixed_MS.tif"

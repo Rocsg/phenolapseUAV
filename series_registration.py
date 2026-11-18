@@ -43,7 +43,7 @@ STATE_FILENAME = "manual_registration_state.json"
 
 def _relative_path(path: Path, base_directory: Path) -> str:
     """Return a portable path from the common Raw/REGISTERED parent."""
-    return str(Path(path).resolve().relative_to(base_directory.resolve()))
+    return Path(path).resolve().relative_to(base_directory.resolve()).as_posix()
 
 
 def _resolve_saved_path(path: str, base_directory: Path) -> Path:
